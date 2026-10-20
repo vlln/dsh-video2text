@@ -1,4 +1,4 @@
-<h1 align="center"><img src="icon.svg" alt="" width="40" align="absmiddle"> dsh-video2text</h1>
+<h1 align="center"><img src="icon.svg" alt="" width="32" align="absmiddle"> dsh-video2text</h1>
 
 <p align="center">粘贴视频链接，得到「发布文案 + 口播逐字稿」。插件自带 skill，界面上是一个侧栏工作台。</p>
 
