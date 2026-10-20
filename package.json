@@ -1,0 +1,57 @@
+{
+  "name": "dsh-video2text",
+  "version": "0.1.0",
+  "description": "视频链接转文案：侧栏工作台（播放器 + 逐字稿 + 发布导出），自带 video2text skill",
+  "type": "module",
+  "main": "lib/index.mjs",
+  "icon": "./icon.svg",
+  "files": [
+    "lib",
+    "docs",
+    "skills",
+    "locale",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "default": "./lib/index.mjs"
+    },
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "video",
+    "transcript",
+    "asr",
+    "douyin",
+    "xiaohongshu",
+    "bilibili",
+    "youtube"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vlln/dsh-video2text.git"
+  },
+  "homepage": "https://github.com/vlln/dsh-video2text",
+  "author": "vlln"
+}

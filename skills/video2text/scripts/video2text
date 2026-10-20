@@ -1,0 +1,2103 @@
+#!/usr/bin/env python3
+"""video2text — 视频链接 → 文案（元数据 + 本地语音转写）。
+
+本地优先：下载/取元数据后，所有转写都在本机完成。
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import zipfile
+from pathlib import Path
+
+PLATFORM_NAMES = {"bilibili": "B站", "youtube": "YouTube", "douyin": "抖音",
+                  "xiaohongshu": "小红书", "weibo": "微博", "file": "本地文件"}
+
+UA_MOBILE = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+             "Mobile/15E148 Safari/604.1")
+UA_DESKTOP = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+# ---------------------------------------------------------------- utilities
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def have(binary: str) -> bool:
+    return shutil.which(binary) is not None
+
+
+def ytdlp_cmd() -> list[str]:
+    """Prefer a local yt-dlp; fall back to uvx so the skill works with zero install."""
+    if have("yt-dlp"):
+        return ["yt-dlp"]
+    if have("uvx"):
+        return ["uvx", "yt-dlp"]
+    raise RuntimeError("yt-dlp not found: brew install yt-dlp  (或安装 uv)")
+
+
+def slugify(title: str, limit: int = 60) -> str:
+    title = re.sub(r"[/\\:*?\"<>|\n\r\t]", " ", title).strip()
+    title = re.sub(r"\s+", " ", title)
+    return title[:limit].strip() or "untitled"
+
+
+def ffmpeg_to_wav(src: Path, dst: Path, max_seconds: float | None = None) -> None:
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src), "-vn",
+           "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"]
+    if max_seconds:
+        cmd += ["-t", str(max_seconds)]
+    cmd.append(str(dst))
+    p = run(cmd)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {p.stderr[-800:]}")
+
+
+# ---------------------------------------------------------------- platform
+
+def detect(url: str) -> tuple[str, str]:
+    """Return (platform, canonical_id_or_url)."""
+    u = url.strip()
+    m = re.search(r"weixin\.qq\.com/sph/([A-Za-z0-9]+)", u)
+    if m:
+        return "wechat", m.group(1)
+    m = re.search(r"channels\.weixin\.qq\.com/finder-preview/pages/sph\?.*?\bid=([A-Za-z0-9]+)", u)
+    if m:
+        return "wechat", m.group(1)
+    if "bilibili.com" in u or "b23.tv" in u:
+        return "bilibili", u
+    if "douyin.com" in u:
+        return "douyin", u
+    if "xiaohongshu.com" in u or "xhslink.com" in u or "xhslink.cn" in u:
+        return "xiaohongshu", u
+    if "youtube.com" in u or "youtu.be" in u:
+        return "youtube", u
+    return "generic", u
+
+
+# ---------------------------------------------------------------- wechat
+
+def wechat_preview(short_id: str) -> dict:
+    """视频号分享页的预览接口：无需登录即可拿到描述/作者/封面（不含视频文件）。"""
+    import urllib.request
+    rid = str(uuid.uuid4())
+    page = "https://channels.weixin.qq.com/finder-preview/pages/sph"
+    qs = urllib.parse.urlencode({"_rid": rid, "_pageUrl": page})
+    req = urllib.request.Request(
+        f"https://channels.weixin.qq.com/finder-preview/api/feed/get_feed_info?{qs}",
+        data=json.dumps({"baseReq": {"generalToken": ""}, "shortUri": short_id}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Origin": "https://channels.weixin.qq.com",
+            "Referer": f"{page}?id={short_id}",
+            "User-Agent": UA_MOBILE,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=25) as r:
+        data = json.loads(r.read().decode())
+    if data.get("errCode") != 0:
+        raise RuntimeError(f"wechat preview api: {data.get('errMsg')}")
+    return data["data"]
+
+
+def wechat_meta(short_id: str) -> dict:
+    data = wechat_preview(short_id)
+    feed = data.get("feedInfo", {})
+    author = data.get("authorInfo", {})
+    desc = feed.get("description", "")
+    first = desc.split("#")[0].strip() or desc.strip()
+    ts = feed.get("createtime")
+    return {
+        "platform": "微信视频号",
+        "title": first[:80] or "视频号视频",
+        "description": desc,
+        "author": author.get("nickname", ""),
+        "published": time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "",
+        "stats": {label: feed.get(key) for key, label in
+                  (("likeCountFmt", "点赞"), ("commentCountFmt", "评论"),
+                   ("forwardCountFmt", "转发"), ("favCountFmt", "收藏")) if feed.get(key)},
+        "cover": feed.get("coverUrl", ""),
+        "url": f"https://weixin.qq.com/sph/{short_id}",
+        "media_available": False,
+    }
+
+
+def video2text_cache() -> Path:
+    return Path(os.environ.get("VIDEO2TEXT_CACHE", Path.home() / ".cache/video2text"))
+
+
+def wechat_login(timeout: int = 240) -> Path:
+    """开一个独立 Chrome，等用户扫码登录腾讯元宝，然后落盘 .tencent.com Cookie。"""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("需要 playwright：pip install playwright，或手动从浏览器复制 Cookie")
+    cache = video2text_cache()
+    cache.mkdir(parents=True, exist_ok=True)
+    AUTH_NAMES = {"hy_user", "hy_token", "hy_source", "hy_username", "hy_userid", "hy_uid"}
+    with sync_playwright() as p:
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        opts = {"proxy": {"server": proxy}} if proxy else {}
+        ctx = p.chromium.launch_persistent_context(
+            str(cache / "chrome-profile"), channel="chrome",
+            headless=os.environ.get("VIDEO2TEXT_HEADLESS") == "1",
+            chromium_sandbox=True,
+            viewport={"width": 1080, "height": 820}, **opts)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://yuanbao.tencent.com/chat", wait_until="domcontentloaded", timeout=60000)
+        log("请在打开的窗口里用微信扫码登录腾讯元宝（扫码后手机上还要点「确认登录」）")
+        deadline = time.time() + timeout
+        started = time.time()
+        last_note = 0.0
+        cookie_str = ""
+        while time.time() < deadline:
+            cookies = [c for c in ctx.cookies() if "tencent.com" in c["domain"]]
+            if any(c["name"].lower() in AUTH_NAMES and len(c["value"]) > 8 for c in cookies):
+                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                break
+            waited = time.time() - started
+            if waited - last_note >= 8:
+                last_note = waited
+                log(f"等待扫码中… 已等 {int(waited)}s / {timeout}s")
+            page.wait_for_timeout(1000)
+        ctx.close()
+    if not cookie_str:
+        raise RuntimeError(f"登录超时（{timeout}s），未拿到有效 Cookie")
+    path = cache / "yuanbao.cookie"
+    path.write_text(cookie_str, encoding="utf-8")
+    log(f"登录成功，登录态已保存（{path}）")
+    return path
+
+
+def wechat_cookie(args) -> str:
+    cookie = args.cookie or os.environ.get("WX_YUANBAO_COOKIE", "")
+    if cookie.startswith("@"):
+        return Path(cookie[1:]).expanduser().read_text(encoding="utf-8").strip()
+    if cookie:
+        return cookie
+    cached = video2text_cache() / "yuanbao.cookie"
+    return cached.read_text(encoding="utf-8").strip() if cached.exists() else ""
+
+
+# ---------------------------------------------------------------- wechat full path
+
+WX_ASSETS = {
+    "wasm_video_decode.js":
+        "https://aladin.wxqcloud.qq.com/aladin/ffmepeg/video-decode/1.2.46/wasm_video_decode.js",
+    "wasm_video_decode.wasm":
+        "https://aladin.wxqcloud.qq.com/aladin/ffmepeg/video-decode/1.2.46/wasm_video_decode.wasm",
+}
+
+YUANBAO_PARSE = "https://yuanbao.tencent.com/api/weixin/get_parse_result"
+YUANBAO_HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "content-type": "application/json",
+    "origin": "https://yuanbao.tencent.com",
+    "referer": "https://yuanbao.tencent.com/chat/naQivTmsDa/cf4d0079-ed1b-4c55-a3f3-2ca1379727d1",
+    "user-agent": UA_DESKTOP,
+    "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "t-userid": "b9575f6b0a8c4a55a08096904a5ef20a",
+    "x-agentid": "naQivTmsDa/cf4d0079-ed1b-4c55-a3f3-2ca1379727d1",
+    "x-commit-tag": "72282a0d",
+    "x-device-id": "1921b001708100d7fa31002b9646bd0cc15a3e2e1f",
+    "x-hy92": "e963067ffa31002b9646bd0c03000008b1951a",
+    "x-hy93": "1921b001708100d7fa31002b9646bd0cc15a3e2e1f",
+    "x-id": "b9575f6b0a8c4a55a08096904a5ef20a",
+    "x-instance-id": "5",
+    "x-language": "zh-CN",
+    "x-platform": "mac",
+    "x-requested-with": "XMLHttpRequest",
+    "x-source": "web",
+    "x-web-third-source": "main",
+    "x-webdriver": "0",
+    "x-webversion": "2.69.0",
+    "x-ybuitest": "0",
+}
+
+
+def _open(req, timeout: int = 30):
+    host = urllib.parse.urlparse(req.full_url).hostname or ""
+    if host in ("127.0.0.1", "localhost"):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _post_json(url: str, payload: dict, headers: dict, timeout: int = 30) -> dict:
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    with _open(req, timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def wechat_parse(share_url: str, cookie: str) -> dict:
+    """腾讯元宝的分享链接解析：sph 链接 → wx_export_id + playable_url(token/eid)。"""
+    try:
+        data = _post_json(YUANBAO_PARSE, {"type": "video_channel_url", "url": share_url, "scene": 1},
+                          {**YUANBAO_HEADERS, "Cookie": cookie})
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise RuntimeError("[auth:wechat] 元宝接口 401：Cookie 无效或已过期，需要重新扫码登录"
+                               "（或跑 --login-wechat）") from None
+        raise
+    d = data.get("data") or {}
+    if not d.get("wx_export_id"):
+        raise RuntimeError(f"元宝解析失败: {data.get('msg') or data.get('error') or data}")
+    return d
+
+
+def _find_feed_info(node):
+    if isinstance(node, dict):
+        if any(k in node for k in ("createtime", "likeCountFmt", "description")):
+            return node
+        for v in node.values():
+            hit = _find_feed_info(v)
+            if hit:
+                return hit
+    elif isinstance(node, list):
+        for v in node:
+            hit = _find_feed_info(v)
+            if hit:
+                return hit
+    return None
+
+
+def _find_media(node):
+    if isinstance(node, dict):
+        if node.get("decode_key") and (node.get("url") or node.get("file_size")):
+            return node
+        if node.get("videoUrl"):
+            return node
+        for v in node.values():
+            hit = _find_media(v)
+            if hit:
+                return hit
+    elif isinstance(node, list):
+        for v in node:
+            hit = _find_media(v)
+            if hit:
+                return hit
+    return None
+
+
+def wechat_feed_media(export_id: str, token: str) -> dict:
+    rid = f"{int(time.time()):x}-{uuid.uuid4().hex[:8]}"
+    page = "https://channels.weixin.qq.com/finder-preview/pages/feed"
+    qs = urllib.parse.urlencode({"_rid": rid, "_pageUrl": page})
+    referer = (page + "?entry_card_type=48&comment_scene=39&appid=0&token="
+               + urllib.parse.quote(token) + "&entry_scene=0&eid=" + urllib.parse.quote(export_id))
+    data = _post_json(
+        f"https://channels.weixin.qq.com/finder-preview/api/feed/get_feed_info?{qs}",
+        {"baseReq": {"generalToken": token}, "exportId": export_id},
+        {**YUANBAO_HEADERS, "accept-language": "zh-CN,zh;q=0.9",
+         "origin": "https://channels.weixin.qq.com", "referer": referer,
+         "sec-ch-ua-platform": '"macOS"', "sec-fetch-site": "same-origin"},
+    )
+    err = (data.get("data") or {}).get("errMsg")
+    if isinstance(err, dict) and err.get("type"):
+        detail = err.get("title") or err.get("content") or err
+        raise RuntimeError(f"视频不可播放（{detail}）——分享链接通常 24 小时过期，请重新分享获取新链接")
+    media = _find_media(data)
+    if not media:
+        raise RuntimeError("响应中没有 videoUrl/decode_key（链接过期或需要重新解析）")
+    info = _find_feed_info(data) or {}
+    return media, info
+
+
+def http_download(url: str, dest: Path, headers: dict | None = None) -> None:
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": UA_DESKTOP})
+    with _open(req, 180) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f)
+
+
+def wx_assets(cache: Path) -> Path:
+    cache.mkdir(parents=True, exist_ok=True)
+    for name, url in WX_ASSETS.items():
+        target = cache / name
+        if not target.exists() or target.stat().st_size < 10000:
+            log(f"下载解密模块 {name}…")
+            http_download(url, target)
+            raw = target.read_bytes()
+            if raw[:2] == b"\x1f\x8b":          # CDN 固定 gzip，先解开
+                import gzip
+                target.write_bytes(gzip.decompress(raw))
+    return cache
+
+
+def wx_decrypt(path: Path, decode_key: str) -> None:
+    """视频号只加密前 128KB：ISAAC-64 keystream(官方 wasm) reverse 后 XOR。"""
+    cache = wx_assets(Path(os.environ.get("VIDEO2TEXT_CACHE", Path.home() / ".cache/video2text")))
+    ks_path = cache / f"ks_{decode_key}.bin"
+    if not ks_path.exists():
+        if not have("node"):
+            raise RuntimeError("需要 node 来运行微信官方 wasm 解密模块")
+        helper = Path(__file__).resolve().parent / "keystream.js"
+        p = run(["node", str(helper), str(decode_key), str(cache), str(ks_path)])
+        if p.returncode != 0 or not ks_path.exists():
+            raise RuntimeError(f"keystream failed: {p.stderr[-400:] or p.stdout[-400:]}")
+    ks = ks_path.read_bytes()
+    blob = bytearray(path.read_bytes())
+    n = min(131072, len(blob), len(ks))
+    for i in range(n):
+        blob[i] ^= ks[i]
+    path.write_bytes(blob)
+
+
+def wechat_session_parse(share_url: str, timeout: int = 900) -> dict:
+    """登录态在浏览器里：扫码 → 页面内直接调元宝解析（指纹头/会话 cookie 都在页面里）。"""
+    helper = Path(__file__).resolve().parent / "wx_session.py"
+    p = run([sys.executable, str(helper), share_url, str(timeout)], timeout=timeout + 120)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout).strip()[-300:] or "session resolve failed")
+    lines = [l for l in p.stdout.strip().splitlines() if l.startswith("{")]
+    if not lines:
+        raise RuntimeError("session resolve returned no data")
+    return json.loads(lines[-1])["parse"]
+
+
+def wechat_preflight(share_url: str, timeout: int = 25) -> dict | None:
+    """无窗口预检：用已保存的登录态在无头浏览器里试解析一次。"""
+    helper = Path(__file__).resolve().parent / "wx_session.py"
+    env = {**os.environ, "WX_PREFLIGHT": "1"}
+    p = run([sys.executable, str(helper), share_url, str(timeout)], env=env, timeout=timeout + 30)
+    if p.returncode != 0:
+        return None
+    lines = [l for l in (p.stdout or "").strip().splitlines() if l.startswith("{")]
+    if not lines:
+        return None
+    try:
+        return json.loads(lines[-1])["parse"]
+    except Exception:
+        return None
+
+
+def wechat_full(short_id: str, cookie: str | None, work: Path,
+                session_timeout: int = 900) -> tuple[dict, Path]:
+    share_url = f"https://weixin.qq.com/sph/{short_id}"
+    if cookie:
+        log("[2/3] 元宝解析分享链接（Cookie）…")
+        try:
+            parsed = wechat_parse(share_url, cookie)
+        except RuntimeError as e:
+            profile = video2text_cache() / "chrome-profile"
+            if "[auth:wechat]" not in str(e) or not profile.exists():
+                raise
+            log("[2/3] Cookie 解析失败（元宝绑定设备指纹），改用登录态会话…")
+            parsed = wechat_preflight(share_url) or wechat_session_parse(share_url, session_timeout)
+    else:
+        log("[2/3] 预检登录态（无窗口）…")
+        parsed = wechat_preflight(share_url)
+        if parsed:
+            log("[2/3] 登录态有效，直接解析")
+        else:
+            log("[2/3] 未检测到有效登录态，打开窗口扫码…")
+            parsed = wechat_session_parse(share_url, session_timeout)
+    playable = parsed.get("playable_url") or ""
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(playable).query)
+    token = (q.get("token") or [""])[0]
+    export_id = (q.get("eid") or ["", parsed.get("wx_export_id", "")])[0]
+    log("[2/3] 取媒体地址与 decode_key…")
+    media, info = wechat_feed_media(export_id, token)
+    video = work / "wechat_video.mp4"
+    url = media.get("url") or media.get("videoUrl") or (media.get("h264VideoInfo") or {}).get("videoUrl")
+    log("[2/3] 下载视频…")
+    try:
+        http_download(url, video)
+    except urllib.error.HTTPError as e:
+        if e.code not in (403, 401):
+            raise
+        http_download(url, video,
+                      {"User-Agent": UA_DESKTOP, "Referer": "https://channels.weixin.qq.com/"})
+    if media.get("decode_key"):
+        log("[2/3] 解密（前 128KB）…")
+        wx_decrypt(video, str(media["decode_key"]))
+    else:
+        log("[2/3] 该预览流未加密，跳过解密")
+    ts = info.get("createtime")
+    desc_text = parsed.get("desc") or info.get("description") or ""
+    first_line = next((ln.strip() for ln in desc_text.splitlines() if ln.strip()), "")
+    first_line = first_line.split("#")[0].strip() or first_line
+    meta = {
+        "platform": "微信视频号",
+        "title": first_line[:80] or "视频号视频",
+        "description": parsed.get("desc") or info.get("description", ""),
+        "author": parsed.get("author", ""),
+        "published": time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "",
+        "stats": {label: info.get(key) for key, label in
+                  (("likeCountFmt", "点赞"), ("commentCountFmt", "评论"),
+                   ("forwardCountFmt", "转发"), ("favCountFmt", "收藏")) if info.get(key)},
+        "cover": parsed.get("cover_url", ""),
+        "url": share_url,
+        "media_path": str(video),
+        "media_available": True,
+        "file_size": media.get("file_size"),
+    }
+    wav = work / "audio16k.wav"
+    ffmpeg_to_wav(video, wav, None)
+    return meta, wav
+
+
+# ---------------------------------------------------------------- yt-dlp
+
+def yt_plugin_dirs() -> list[str]:
+    """yt-dlp 插件目录。显式配置优先；否则交给 yt-dlp 自己发现（~/.config/yt-dlp/plugins）。"""
+    explicit = cfg("yt_plugin_dirs").strip()
+    if not explicit:
+        return []
+    return ["--plugin-dirs", explicit]
+
+
+def yt_extractor_args() -> list[str]:
+    """YouTube 的反爬绕过。
+
+    - `yt_pot_baseurl`：bgutil 的 HTTP provider 地址，配合 **yt-dlp 插件**
+      `bgutil-ytdlp-pot-provider`（2.x）使用，参数键是 `youtubepot-bgutilhttp:base_url`。
+      没有装插件时这个参数会被忽略（不会报错）。
+    - `yt_player_client`：指定 player client，多个用逗号分隔。
+    """
+    args: list[str] = []
+    pot = cfg("yt_pot_baseurl").strip()
+    client = cfg("yt_player_client").strip()
+    if pot:
+        args += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={pot}"]
+    if client:
+        args += ["--extractor-args", f"youtube:player_client={client}"]
+    return args
+
+
+def yt_meta(url: str, cookies: str | None, cookies_file: str | None = None) -> dict:
+    cmd = ytdlp_cmd() + ["-J", "--no-warnings", "--socket-timeout", "20"] + yt_plugin_dirs() + yt_extractor_args()
+    cmd += yt_plugin_dirs() + yt_extractor_args()
+    if cookies:
+        cmd += ["--cookies-from-browser", cookies]
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
+    cmd.append(url)
+    p = run(cmd)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip()[-600:])
+    d = json.loads(p.stdout)
+    return {
+        "platform": PLATFORM_NAMES.get((d.get("extractor_key") or "").lower(),
+                                       d.get("extractor_key") or ""),
+        "title": d.get("title") or "",
+        "description": d.get("description") or "",
+        "author": d.get("uploader") or d.get("channel") or "",
+        "published": fmt_date(d.get("upload_date")),
+        "duration": d.get("duration"),
+        "stats": {label: v for label, v in (("播放", d.get("view_count")),
+                                            ("点赞", d.get("like_count"))) if v},
+        "thumbnail": d.get("thumbnail") or "",
+        "url": url,
+        "media_available": True,
+    }
+
+
+def yt_download_audio(url: str, outdir: Path, cookies: str | None,
+                      max_seconds: float | None,
+                      cookies_file: str | None = None,
+                      video: bool = False) -> tuple[Path, Path]:
+    tpl = str(outdir / "media.%(ext)s")
+    if video:
+        cmd = ytdlp_cmd() + ["-f", "bv*+ba/b", "--merge-output-format", "mp4",
+               "--no-playlist", "--no-warnings", "--socket-timeout", "20",
+               "-o", str(outdir / "source.%(ext)s")]
+    else:
+        cmd = ytdlp_cmd() + ["-f", "bestaudio/best", "-x", "--audio-format", "wav",
+               "--postprocessor-args", "ffmpeg:-ar 16000 -ac 1",
+               "--no-playlist", "--no-warnings", "--socket-timeout", "20",
+               "-o", tpl]
+    cmd += yt_plugin_dirs() + yt_extractor_args()
+    if cookies:
+        cmd += ["--cookies-from-browser", cookies]
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
+    cmd.append(url)
+    p = run(cmd)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip()[-800:])
+    pattern = "source.*" if video else "media*"
+    files = sorted(outdir.glob(pattern), key=lambda f: f.stat().st_size, reverse=True)
+    if not files:
+        raise RuntimeError("yt-dlp produced no file")
+    src = files[0]
+    wav = outdir / "audio16k.wav"
+    ffmpeg_to_wav(src, wav, max_seconds)
+    return wav, src
+
+
+# ---------------------------------------------------------------- ASR
+
+def asr_backend(requested: str) -> str:
+    if requested == "api":
+        return "api"
+    if requested != "auto":
+        return requested
+    if sys.platform == "darwin" and os.uname().machine == "arm64" and (
+            have("mlx_whisper") or have("uvx")):
+        return "mlx"
+    if have("whisper-cli"):
+        return "whispercpp"
+    raise RuntimeError("no ASR backend found: install mlx-whisper (macOS) or whisper.cpp")
+
+
+def asr_transcribe(wav: Path, backend: str, model: str | None, lang: str,
+                   outdir: Path, fixes: dict[str, str] | None = None) -> list[dict]:
+    srt = outdir / "asr.srt"
+    if backend == "mlx":
+        exe = ["mlx_whisper"] if have("mlx_whisper") else ["uvx", "--from", "mlx-whisper", "mlx_whisper"]
+        cmd = exe + [str(wav), "--model", model or "mlx-community/whisper-large-v3-turbo",
+                     "--output-format", "srt", "--output-dir", str(outdir),
+                     "--task", "transcribe", "--verbose", "False",
+                     "--hallucination-silence-threshold", "2"]
+        if lang:
+            cmd += ["--language", lang]
+        p = run(cmd)
+        if p.returncode != 0:
+            raise RuntimeError(f"mlx_whisper failed: {p.stderr[-800:]}")
+        produced = list(outdir.glob("*.srt"))
+        if not produced:
+            raise RuntimeError("mlx_whisper produced no srt")
+        produced[0].replace(srt)
+    elif backend == "whispercpp":
+        p = run(["whisper-cli", "-m", model or "models/ggml-large-v3-turbo.bin",
+                 "-f", str(wav), "-l", lang or "zh", "-osrt", "-of", str(outdir / "asr")])
+        if p.returncode != 0 or not srt.exists():
+            raise RuntimeError(f"whisper-cli failed: {p.stderr[-800:]}")
+    else:
+        raise ValueError(f"unknown backend {backend}")
+    segs = parse_srt(srt)
+    return apply_fixes(segs, fixes or {})
+
+
+def apply_fixes(segs: list[dict], fixes: dict[str, str]) -> list[dict]:
+    if not fixes:
+        return segs
+    for s in segs:
+        for bad, good in fixes.items():
+            s["text"] = s["text"].replace(bad, good)
+    return segs
+
+
+def parse_srt(path: Path) -> list[dict]:
+    text = path.read_text(encoding="utf-8", errors="ignore").replace("\r\n", "\n")
+    segs = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = [l for l in block.split("\n") if l.strip()]
+        if len(lines) < 2:
+            continue
+        m = re.match(r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)", lines[1] if "-->" in lines[1] else "")
+        if not m:
+            continue
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = map(int, m.groups())
+        start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
+        end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
+        body = " ".join(lines[2:]).strip()
+        if body:
+            segs.append({"start": round(start, 2), "end": round(end, 2), "text": body})
+    return segs
+
+
+# ---------------------------------------------------------------- config
+
+CONFIG_PATH = Path(os.environ.get("VIDEO2TEXT_CONFIG",
+                                  Path.home() / ".config" / "video2text" / "config.json"))
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def cfg_bool(name: str, default: bool = False) -> bool:
+    raw = cfg(name).strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def cfg_int(name: str, default: int) -> int:
+    try:
+        return int(float(cfg(name)))
+    except (TypeError, ValueError):
+        return default
+
+
+def cfg(name: str) -> str:
+    """环境变量优先，其次固定配置文件（~/.config/video2text/config.json）。"""
+    return os.environ.get(name.upper()) or str(load_config().get(name.lower(), ""))
+
+
+def save_config(updates: dict) -> Path:
+    data = load_config()
+    data.update(updates)
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return CONFIG_PATH
+
+
+SECRET_HINTS = ("key", "cookie", "token", "secret")
+
+
+def is_secret(name: str) -> bool:
+    return any(hint in name.lower() for hint in SECRET_HINTS)
+
+
+def mask(value: str) -> str:
+    value = str(value or "")
+    if not value:
+        return ""
+    if len(value) <= 12:
+        return "••••"
+    return f"{value[:4]}…{value[-4:]}"
+
+
+def config_show(reveal: bool = False) -> int:
+    """打印配置；默认密钥类字段打码，reveal 时原样输出（本地界面用）。"""
+    data = load_config()
+    masked = {k: (v if reveal or not is_secret(k) else mask(v)) for k, v in data.items()}
+    print(json.dumps({"path": str(CONFIG_PATH), "config": masked,
+                      "secret_keys": [k for k in data if is_secret(k)]},
+                     ensure_ascii=False, indent=2))
+    return 0
+
+
+def config_merge() -> int:
+    """从 stdin 读 JSON 合并进固定配置（避免把密钥留在命令行里）。"""
+    raw = sys.stdin.read()
+    try:
+        updates = json.loads(raw or "{}")
+    except Exception as e:
+        raise RuntimeError(f"配置不是合法 JSON：{e}")
+    if not isinstance(updates, dict):
+        raise RuntimeError("配置必须是对象")
+    clean = {k: v for k, v in updates.items()
+             if isinstance(k, str) and k and v is not None and not k.startswith("_")}
+    if not clean:
+        raise RuntimeError("没有需要写入的配置项")
+    path = save_config(clean)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    print(path)
+    return 0
+
+
+def write_netscape_cookies(cookies, path: Path) -> None:
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in cookies:
+        exp = int(c.get("expires") or 0)
+        exp = exp if exp > 0 else int(time.time()) + 86400
+        lines.append("\t".join([c["domain"], "TRUE" if c["domain"].startswith(".") else "FALSE",
+                                 c.get("path", "/"), "TRUE" if c.get("secure") else "FALSE",
+                                 str(exp), c["name"], c["value"]]))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+SITE_LOGIN = {
+    "douyin": ("https://www.douyin.com/", ("sessionid", "sid_guard", "sid_tt")),
+    "xhs": ("https://www.xiaohongshu.com/explore", ("web_session",)),
+}
+
+
+def site_login(platform: str, timeout: int = 240) -> Path:
+    """打开浏览器扫码登录，把 Cookie 写进固定配置（Agent 只负责让用户扫码）。"""
+    from playwright.sync_api import sync_playwright
+    url, markers = SITE_LOGIN[platform]
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    opts = {"proxy": {"server": proxy}} if proxy else {}
+    profile = CONFIG_PATH.parent / f"chrome-{platform}"
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            str(profile), channel="chrome",
+            headless=os.environ.get("VIDEO2TEXT_HEADLESS") == "1",
+            chromium_sandbox=True,
+            viewport={"width": 1180, "height": 860}, **opts)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)
+        if platform == "douyin":
+            for text in ("登录", "Log in", "Log In"):
+                try:
+                    page.get_by_text(text, exact=True).first.click(timeout=3000)
+                    break
+                except Exception:
+                    continue
+            page.wait_for_timeout(2000)
+        try:
+            page.bring_to_front()
+            page.wait_for_timeout(500)
+            page.screenshot(path=str(CONFIG_PATH.parent / f"login-{platform}.png"))
+        except Exception:
+            pass
+        log(f"请在窗口里扫码登录 {platform}…")
+        deadline = time.time() + timeout
+        cookie_str = ""
+        while time.time() < deadline:
+            cookies = ctx.cookies()
+            hit = any(c["name"] in markers and len(c["value"]) > 8 for c in cookies)
+            if hit:
+                keep = [c for c in cookies if platform.split(".")[0] in c["domain"] or "xiaohongshu" in c["domain"] or "douyin" in c["domain"]]
+                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in keep or cookies)
+                write_netscape_cookies(keep or cookies, CONFIG_PATH.parent / f"{platform}_cookies.txt")
+                break
+            page.wait_for_timeout(1500)
+        ctx.close()
+    if not cookie_str:
+        raise RuntimeError(f"{platform} 登录超时")
+    return save_config({f"{platform}_cookie": cookie_str})
+
+
+# ---------------------------------------------------------------- douyin
+
+def resolve_douyin(url: str) -> str:
+    m = re.search(r"/(?:video|note)/(\d{15,})", url)
+    if m:
+        return m.group(1)
+    req = urllib.request.Request(url, headers={"User-Agent": UA_MOBILE})
+    with _open(req, 30) as r:
+        final = r.geturl()
+    m = re.search(r"/(?:video|note)/(\d{15,})", final)
+    if not m:
+        raise RuntimeError(f"无法从分享链接解析作品 ID: {final[:120]}")
+    return m.group(1)
+
+
+def douyin_cookie_status() -> dict:
+    """抖音登录态。`code` 供 UI 本地化，`detail` 给人直接看。"""
+    cookie = cfg("DOUYIN_COOKIE")
+    if not cookie:
+        return {"ok": False, "code": "missing", "detail": "未配置 DOUYIN_COOKIE（运行 --login douyin）", "until": ""}
+    ck = {}
+    for part in cookie.split("; "):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            ck[k] = v
+    if not (ck.get("sessionid") or ck.get("sid_tt")):
+        return {"ok": False, "code": "invalid", "detail": "Cookie 中没有 sessionid，登录无效", "until": ""}
+    guard = ck.get("sid_guard", "")
+    if guard:
+        parts = urllib.parse.unquote(guard).split("|")
+        if len(parts) >= 3:
+            try:
+                exp = int(parts[1]) + int(parts[2])
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(exp))
+                if time.time() > exp:
+                    return {"ok": False, "code": "expired", "detail": f"登录已过期（{when}）", "until": when}
+                return {"ok": True, "code": "valid", "detail": f"登录有效至 {when}", "until": when}
+            except ValueError:
+                pass
+    return {"ok": True, "code": "opaque", "detail": "Cookie 存在（未解析到有效期）", "until": ""}
+
+
+def douyin_item(url: str) -> dict:
+    douk = cfg("DOUK_PATH")
+    cookie = cfg("DOUYIN_COOKIE")
+    if not douk or not cookie:
+        raise RuntimeError("需要 DOUK_PATH 与 DOUYIN_COOKIE（见 docs/backends.md）")
+    state = douyin_cookie_status()
+    if not state["ok"]:
+        raise RuntimeError(f"抖音{state['detail']}，请运行 --login douyin 重新扫码")
+    aweme_id = resolve_douyin(url)
+    helper = Path(__file__).resolve().parent / "douyin_detail.py"
+    env = dict(os.environ)
+    p = run(["uv", "run", "python", str(helper), aweme_id, douk, cookie],
+            cwd=douk, env=env)
+    if p.returncode != 0:
+        err = (p.stderr or "").strip()[-300:] or "douyin detail failed"
+        if "403" in err or "Uifid" in err or "登录" in err:
+            raise RuntimeError("[auth:douyin] 抖音登录态失效或被风控（403/Uifid），需要重新扫码登录")
+        raise RuntimeError(err)
+    return json.loads(p.stdout.strip().splitlines()[-1])
+
+
+def douyin_fetch(url: str, work: Path) -> tuple[dict, Path]:
+    item = douyin_item(url)
+    video = item.get("video") or {}
+    urls = (video.get("play_addr") or {}).get("url_list") or []
+    if not urls:
+        raise RuntimeError("作品没有可下载地址")
+    dest = work / "douyin_video.mp4"
+    http_download(urls[0], dest, {"User-Agent": UA_DESKTOP, "Referer": "https://www.douyin.com/"})
+    ts = item.get("create_time")
+    stat = item.get("statistics") or {}
+    meta = {
+        "platform": "抖音",
+        "title": (item.get("desc") or "抖音作品").splitlines()[0][:80],
+        "description": item.get("desc", ""),
+        "author": (item.get("author") or {}).get("nickname", ""),
+        "published": time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "",
+        "stats": {k: stat.get(v) for k, v in (("点赞", "digg_count"), ("评论", "comment_count"),
+                                              ("收藏", "collect_count"), ("转发", "share_count")) if stat.get(v)},
+        "url": url,
+        "media_available": True,
+    }
+    return meta, dest
+
+
+# ---------------------------------------------------------------- xhs
+
+XHS_APP_UA = "com.xingin.xhs/8.0 (iPhone; iOS 17.0; Scale/3.00)"
+
+
+def resolve_xhs(url: str) -> str:
+    if "xhslink" not in url:
+        return url
+    req = urllib.request.Request(url, headers={"User-Agent": XHS_APP_UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.geturl()
+
+
+def xhs_data(url: str) -> dict:
+    api = (cfg("XHS_API") or "http://127.0.0.1:5556").rstrip("/")
+    resolved = resolve_xhs(url)
+    data = _post_json(f"{api}/xhs/detail",
+                      {"url": resolved, "download": False, "check_record": False},
+                      {"Content-Type": "application/json"}, timeout=120).get("data") or {}
+    if not data:
+        raise RuntimeError("[service:xhs] XHS 服务未返回数据（服务没起、链接失效或需要 Cookie）")
+    return data
+
+
+def xhs_api_fetch(url: str, work: Path, ocr_limits: list[int] | None = None) -> tuple[dict, Path | None]:
+    """走本地 XHS-Downloader 服务（docs/backends.md）。只取地址，文件我们自己下。"""
+    original = url
+    resolved = resolve_xhs(url)
+    data = xhs_data(url)
+    desc = data.get("作品描述", "")
+    meta = {
+        "platform": "小红书",
+        "title": (data.get("作品标题") or (desc.splitlines()[0] if desc else "小红书笔记"))[:80],
+        "description": desc,
+        "author": data.get("作者昵称", ""),
+        "published": (data.get("发布时间") or "")[:10].replace("_", " "),
+        "stats": {k: data.get(f"{k}数量") for k in ("点赞", "收藏", "评论", "分享")
+                  if data.get(f"{k}数量")},
+        "url": original,
+        "resolved_url": resolved,
+        "media_available": bool(data.get("下载地址")),
+    }
+    urls = [u for u in (data.get("下载地址") or []) if u]
+    video_url = next((u for u in urls if not re.search(r"\.(jpe?g|png|webp|heic)(\?|$)", u, re.I)), None)
+    if not video_url:
+        images = [u for u in urls if u] or [data.get("封面地址")]
+        images = [u for u in images if u]
+        if images:
+            limit = (ocr_limits or [ocr_limit()])[0]
+            if limit > 0:
+                log(f"[1/3] 图文作品：OCR {min(len(images), limit)}/{len(images)} 张图…")
+                meta["ocr_text"] = ocr_images(images, limit)
+        return meta, None
+    dest = work / "xhs_video.mp4"
+    http_download(video_url, dest)
+    return meta, dest
+
+
+# ---------------------------------------------------------------- polish
+
+POLISH_SYSTEM = "你是视频口播稿编辑。只做纠错与断句，不扩写、不编造。"
+
+POLISH_TMPL = """下面是视频语音转写，可能有同音错字、没有标点、带有口头禅。
+
+视频标题：{title}
+视频简介：{desc}
+专有名词/术语（优先采用这些写法）：{glossary}
+
+要求：
+1. 修正同音错字与专有名词；不确定的词保留原样并在后面加 [?]
+2. 删除「嗯/那个/就是说」等口头禅和重复
+3. 补标点、按语义分段，每段加一个小标题
+4. 保持原意和说话人语气，不扩写、不编造
+5. 输出 Markdown：一句话摘要 + 分段正文 + 3-5 条要点
+
+转写正文：
+{body}
+"""
+
+
+def build_polish_prompt(meta: dict, body: str, glossary: str) -> str:
+    return POLISH_TMPL.format(
+        title=meta.get("title", ""), desc=meta.get("description", ""),
+        glossary=glossary or "（未提供）", body=body)
+
+
+def call_llm(prompt: str) -> str:
+    base = (cfg("LLM_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    key = cfg("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+    model = cfg("LLM_MODEL") or "gpt-4o-mini"
+    if not key:
+        raise RuntimeError("未设置 LLM_API_KEY / OPENAI_API_KEY")
+    payload = {"model": model, "temperature": 0.2,
+               "messages": [{"role": "system", "content": POLISH_SYSTEM},
+                            {"role": "user", "content": prompt}]}
+    req = urllib.request.Request(f"{base}/chat/completions",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {key}"},
+                                 method="POST")
+    with urllib.request.urlopen(req, timeout=180) as r:
+        return json.loads(r.read().decode())["choices"][0]["message"]["content"]
+
+
+def audio_duration(wav: Path) -> float:
+    p = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(wav)])
+    try:
+        return float(p.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def detect_silences(wav: Path) -> list[tuple[float, float]]:
+    p = run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(wav),
+             "-af", "silencedetect=noise=-35dB:d=0.35", "-f", "null", "-"])
+    starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", p.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", p.stderr)]
+    return list(zip(starts, ends))
+
+
+def split_audio(wav: Path, outdir: Path, chunk_seconds: int = 60,
+                max_seconds: int | None = None) -> list[tuple[Path, float, float]]:
+    """在静音处切片，让云端 ASR 的分片边界尽量落在句子之间。"""
+    dur = audio_duration(wav)
+    max_seconds = max_seconds or max(chunk_seconds * 2, chunk_seconds + 30)
+    if dur <= max_seconds:
+        return [(wav, 0.0, dur)]
+    mids = sorted((a + b) / 2 for a, b in detect_silences(wav))
+    spans: list[tuple[float, float]] = []
+    cur = 0.0
+    while cur < dur - 0.5:
+        remaining = dur - cur
+        if remaining <= max_seconds:
+            nxt = dur
+        else:
+            cand = [m for m in mids if cur + chunk_seconds * 0.6 <= m <= cur + max_seconds]
+            nxt = max(cand) if cand else min(cur + chunk_seconds, dur)
+        if nxt <= cur:
+            nxt = min(cur + chunk_seconds, dur)
+        spans.append((cur, nxt))
+        cur = nxt
+    outdir.mkdir(parents=True, exist_ok=True)
+    chunks = []
+    for i, (start, end) in enumerate(spans):
+        dst = outdir / f"chunk{i:03d}.wav"
+        p = run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(start), "-t", str(end - start),
+                 "-i", str(wav), "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst)])
+        if p.returncode == 0 and dst.exists():
+            chunks.append((dst, start, end))
+    return chunks or [(wav, 0.0, dur)]
+
+
+def _asr_chunk_text(chunk: Path, provider: str, base: str, key: str,
+                    model: str, lang: str) -> str:
+    raw = chunk.read_bytes()
+    if provider in ("qwen", "omni"):
+        content = [{"type": "input_audio",
+                    "input_audio": {"data": "data:audio/wav;base64," + base64.b64encode(raw).decode()}}]
+        if provider == "omni":
+            content.append({"type": "text",
+                            "text": "请逐字转写这段音频，保留标点，只输出转写文本。"})
+        payload = {"model": model, "messages": [{"role": "user", "content": content}], "stream": False}
+        data = _post_json(f"{base}/chat/completions", payload,
+                          {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                          timeout=300)
+        return (data["choices"][0]["message"]["content"] or "").strip()
+
+    boundary = "----v2t" + uuid.uuid4().hex
+    parts = []
+    for name, value in (("model", model), ("language", lang or "zh")):
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode() + raw + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(f"{base}/audio/transcriptions", data=b"".join(parts), method="POST",
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                                          "Authorization": f"Bearer {key}"})
+    with _open(req, 300) as r:
+        return (json.loads(r.read().decode()).get("text") or "").strip()
+
+
+def asr_api_transcribe(wav: Path, work: Path, lang: str,
+                       chunk_seconds: int = 60, retries: int = 3) -> list[dict]:
+    """云端 ASR：Qwen3-ASR / Omni（chat + input_audio）或 OpenAI /audio/transcriptions。"""
+    provider = (cfg("ASR_PROVIDER") or "qwen").lower()
+    key = cfg("ASR_API_KEY")
+    if not key:
+        raise RuntimeError("未配置 ASR_API_KEY（写进 ~/.config/video2text/config.json）")
+    base = (cfg("ASR_BASE_URL") or (
+        "https://dashscope.aliyuncs.com/compatible-mode/v1" if provider in ("qwen", "omni")
+        else "https://api.openai.com/v1")).rstrip("/")
+    model = cfg("ASR_MODEL") or ("qwen3-omni-flash" if provider == "omni"
+                                 else "qwen3-asr-flash" if provider == "qwen" else "whisper-1")
+
+    segs: list[dict] = []
+    chunks = split_audio(wav, work / "chunks", chunk_seconds)
+    for idx, (chunk, offset, end) in enumerate(chunks, 1):
+        text = ""
+        last_err: Exception | None = None
+        for attempt in range(1, max(1, retries) + 1):
+            try:
+                text = _asr_chunk_text(chunk, provider, base, key, model, lang)
+                if text:
+                    break
+                last_err = RuntimeError("空响应")
+            except Exception as e:  # 429/5xx/超时都重试
+                last_err = e
+            if attempt < retries:
+                wait = min(2 ** attempt, 10)
+                log(f"  分片 {idx}/{len(chunks)} 第 {attempt} 次失败（{str(last_err)[:80]}），{wait}s 后重试…")
+                time.sleep(wait)
+        if not text:
+            raise RuntimeError(f"分片 {idx}/{len(chunks)} 转写失败：{last_err}")
+        segs.append({"start": round(offset, 2), "end": round(end, 2), "text": text})
+    return segs
+
+
+# ---------------------------------------------------------------- ocr
+
+OCR_PROMPT = "请逐字提取图片中的文字，保留原有换行与段落。只输出文字，不要解释。"
+
+
+def ocr_image(target: str, base: str, key: str, model: str) -> str:
+    payload = {"model": model, "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": target}},
+        {"type": "text", "text": OCR_PROMPT}]}], "stream": False}
+    data = _post_json(f"{base}/chat/completions", payload,
+                      {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                      timeout=180)
+    return (data["choices"][0]["message"]["content"] or "").strip()
+
+
+def ocr_limit(args_limit: int | None = None) -> int:
+    if args_limit is not None:
+        return max(0, args_limit)
+    try:
+        return max(0, int(cfg("OCR_MAX_IMAGES") or 12))
+    except ValueError:
+        return 12
+
+
+def ocr_images(targets: list[str], limit: int = 12) -> str:
+    if limit <= 0:
+        return ""
+    key = cfg("OCR_API_KEY") or cfg("ASR_API_KEY")
+    if not key:
+        return ""
+    base = (cfg("OCR_BASE_URL") or cfg("ASR_BASE_URL")
+            or "https://openapi.flowhub.com.cn/v1").rstrip("/")
+    model = cfg("OCR_MODEL") or "qwen-vl-ocr"
+    texts = []
+    for i, target in enumerate(targets[:limit], 1):
+        try:
+            text = ocr_image(target, base, key, model)
+            if text:
+                texts.append(text)
+        except Exception as e:
+            log(f"  OCR 第 {i} 张失败：{str(e)[:80]}")
+    return "\n\n".join(texts)
+
+
+# ---------------------------------------------------------------- align
+
+PUNCT = " \t\n\r，。！？；：、,.!?;:…—-\"'“”‘’()（）[]【】《》<>·"
+
+
+def _norm_chars(text: str) -> str:
+    return "".join(ch.lower() for ch in text if ch not in PUNCT)
+
+
+def whisper_word_times(wav: Path, work: Path, model: str | None) -> list[tuple[str, float, float]]:
+    """跑一遍本地 whisper 取词级时间，作为强制对齐的锚点。"""
+    outdir = work / "align"
+    outdir.mkdir(parents=True, exist_ok=True)
+    exe = ["mlx_whisper"] if have("mlx_whisper") else ["uvx", "--from", "mlx-whisper", "mlx_whisper"]
+    cmd = exe + [str(wav), "--model", model or "mlx-community/whisper-large-v3-turbo",
+                 "--output-format", "json", "--output-dir", str(outdir),
+                 "--task", "transcribe", "--verbose", "False",
+                 "--word-timestamps", "True", "--language", "zh"]
+    p = run(cmd)
+    if p.returncode != 0:
+        raise RuntimeError(f"对齐用的本地转写失败：{p.stderr[-300:]}")
+    files = list(outdir.glob("*.json"))
+    if not files:
+        raise RuntimeError("对齐转写没有产出 JSON")
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    words = []
+    for seg in data.get("segments") or []:
+        for w in seg.get("words") or []:
+            text = _norm_chars(str(w.get("word") or ""))
+            if not text:
+                continue
+            words.append((text, float(w.get("start") or 0), float(w.get("end") or 0)))
+    return words
+
+
+def interpolate_sentences(segments: list[dict]) -> list[dict]:
+    """不开对齐时，用标点把分片切成句子，时间按字数在分片内插值。
+
+    时间精度不如词级对齐，但逐字稿可读、播放器能按句高亮，且不需要本地模型。
+    """
+    out: list[dict] = []
+    for seg in segments:
+        parts = _sentences(str(seg.get("text") or ""))
+        if len(parts) <= 1:
+            out.append(seg)
+            continue
+        start = float(seg.get("start") or 0)
+        end = max(float(seg.get("end") or start), start + 0.2)
+        span = end - start
+        total = sum(len(p) for p in parts) or 1
+        cursor = start
+        for part in parts:
+            dur = max(0.4, span * len(part) / total)
+            stop = min(cursor + dur, end)
+            out.append({"start": round(cursor, 2), "end": round(max(stop, cursor + 0.2), 2), "text": part})
+            cursor = stop
+    return out
+
+
+def _sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[。！？!?；;\n])", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def align_segments(chunk_segments: list[dict], wav: Path, work: Path,
+                   model: str | None) -> list[dict]:
+    """把云端文本切句，再用本地词级时间做单调对齐；失败句回退到线性插值。"""
+    words = whisper_word_times(wav, work, model)
+    if not words:
+        raise RuntimeError("没有可用于对齐的词级时间")
+    # whisper 字符序列 + 每个字符的时间
+    wchars, wtimes = [], []
+    for text, start, end in words:
+        n = len(text)
+        for i, ch in enumerate(text):
+            wchars.append(ch)
+            wtimes.append((start, end))
+    sent_texts = []
+    for seg in chunk_segments:
+        sent_texts.extend(_sentences(seg["text"]))
+    if not sent_texts:
+        return chunk_segments
+    cloud = "".join(_norm_chars(t) for t in sent_texts)
+
+    from difflib import SequenceMatcher
+    matcher = SequenceMatcher(None, "".join(wchars), cloud, autojunk=False)
+    # cloud 下标 -> whisper 下标
+    cloud_to_w = {}
+    for a, b, size in matcher.get_matching_blocks():
+        for k in range(size):
+            cloud_to_w[b + k] = a + k
+
+    result = []
+    offset = 0
+    for text in sent_texts:
+        norm = _norm_chars(text)
+        if not norm:
+            offset += len(norm)
+            continue
+        idxs = [cloud_to_w.get(offset + k) for k in range(len(norm))]
+        hits = [i for i in idxs if i is not None]
+        coverage = len(hits) / len(norm)
+        if coverage >= 0.3:
+            start = wtimes[min(hits)][0]
+            end = wtimes[max(hits)][1]
+        else:
+            start = end = None
+        result.append({"text": text, "start": start, "end": end,
+                       "coverage": round(coverage, 2)})
+        offset += len(norm)
+
+    # 未对齐的句子按前后已对齐句线性插值
+    duration = audio_duration(wav)
+    for i, seg in enumerate(result):
+        if seg["start"] is not None:
+            continue
+        prev = next((r for r in reversed(result[:i]) if r["start"] is not None), None)
+        nxt = next((r for r in result[i + 1:] if r["start"] is not None), None)
+        lo = prev["end"] if prev else 0.0
+        hi = nxt["start"] if nxt else duration
+        if hi <= lo:
+            hi = lo + 1.0
+        span = (hi - lo) / max(1, sum(1 for r in result if r["start"] is None))
+        k = sum(1 for r in result[:i] if r["start"] is None)
+        seg["start"], seg["end"] = lo + span * k, lo + span * (k + 1)
+
+    out = []
+    for seg in result:
+        out.append({"start": round(seg["start"], 2), "end": round(seg["end"], 2),
+                    "text": seg["text"].strip()})
+    return out
+
+
+# ---------------------------------------------------------------- render
+
+def ts(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def paragraphs(segments: list[dict], gap: float = 1.2, max_chars: int = 260) -> list[dict]:
+    out: list[dict] = []
+    cur = None
+    for i, s in enumerate(segments):
+        if cur is None:
+            cur = {"start": s["start"], "text": s["text"]}
+        elif (s["start"] - segments[i - 1]["end"] <= gap
+              and len(cur["text"]) + len(s["text"]) < max_chars):
+            cur["text"] += s["text"]
+        else:
+            out.append(cur)
+            cur = {"start": s["start"], "text": s["text"]}
+    if cur:
+        out.append(cur)
+    return out
+
+
+def fmt_date(d: str | None) -> str:
+    if not d or len(d) != 8:
+        return ""
+    return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+
+
+def srt_ts(seconds: float) -> str:
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def render_md(meta: dict, segments: list[dict] | None, note: str = "") -> str:
+    lines = [f"# {meta['title']}", ""]
+    lines += [f"- 平台：{meta.get('platform', '')}",
+              f"- 作者：{meta.get('author', '')}",
+              f"- 发布：{meta.get('published', '')}",
+              f"- 链接：{meta.get('url', '')}"]
+    if meta.get("stats"):
+        lines.append("- 互动：" + " / ".join(f"{k} {v}" for k, v in meta["stats"].items()))
+    if meta.get("duration"):
+        lines.append(f"- 时长：{ts(meta['duration'])}")
+    if meta.get("description"):
+        lines += ["", "## 发布文案", "", meta["description"].strip()]
+    if meta.get("ocr_text"):
+        lines += ["", "## 图文正文（OCR）", "", meta["ocr_text"].strip()]
+    if note:
+        lines += ["", f"> {note}"]
+    if segments:
+        lines += ["", "## 口播正文", ""]
+        for p in paragraphs(segments):
+            lines += [f"**[{ts(p['start'])}]** {p['text']}", ""]
+        lines += ["## 时间轴", ""]
+        lines += [f"- {ts(s['start'])}–{ts(s['end'])} {s['text']}" for s in segments]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# ---------------------------------------------------------------- export
+
+EXPORT_FORMATS = ("publish", "script", "chapters", "srt", "bundle")
+
+
+def ts_long(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rest = divmod(seconds, 3600)
+    if h:
+        return f"{h}:{rest // 60:02d}:{rest % 60:02d}"
+    return f"{rest // 60:02d}:{rest % 60:02d}"
+
+
+def chapter_title(text: str, limit: int = 18) -> str:
+    """取开头一句做小标题：掐在标点处；到限长时优先不切断英文单词。"""
+    body = re.sub(r"\s+", "", text or "")
+    body = re.sub(r"^[，。、；：！？,.;:!?\"'“”‘’]+", "", body)
+    hit = re.search(r"[。！？；!?;]", body[:limit + 8])
+    if hit and hit.start() >= 6:
+        body = body[:hit.start()]
+    if len(body) > limit:
+        comma = re.search(r"[，,、]", body[:limit + 4])
+        if comma and comma.start() >= 6:
+            body = body[:comma.start()]
+        elif re.match(r"[A-Za-z0-9]", body[limit]) and re.match(r"[A-Za-z0-9]", body[limit - 1]):
+            run = re.search(r"[A-Za-z0-9]+$", body[:limit])
+            body = body[:run.start()] if run and run.start() >= 4 else body[:limit]
+        else:
+            body = body[:limit]
+    return body.strip() or "未命名"
+
+
+def chapterize(segments: list[dict], min_sec: float = 35, max_sec: float = 100,
+               max_chars: int = 420) -> list[dict]:
+    """把句子聚成带小标题的章节：优先在停顿处断开，避免过短或过长。"""
+    if not segments:
+        return []
+    spans = []
+    paras = paragraphs(segments, gap=1.0, max_chars=200)
+    last_end = float(segments[-1]["end"])
+    for i, para in enumerate(paras):
+        end = float(paras[i + 1]["start"]) if i + 1 < len(paras) else last_end
+        spans.append({"start": float(para["start"]), "end": max(end, float(para["start"]) + 0.8),
+                      "text": para["text"]})
+    chapters: list[dict] = []
+    cur: dict | None = None
+    for span in spans:
+        if cur is None:
+            cur = dict(span)
+            continue
+        gap = span["start"] - cur["end"]
+        dur = span["end"] - cur["start"]
+        size = len(cur["text"]) + len(span["text"])
+        if (gap >= 1.6 and dur >= min_sec) or dur >= max_sec or size > max_chars:
+            chapters.append(cur)
+            cur = dict(span)
+        else:
+            cur["text"] += span["text"]
+            cur["end"] = span["end"]
+    if cur is not None:
+        chapters.append(cur)
+    for index, chapter in enumerate(chapters):
+        chapter["title"] = chapter_title(chapter["text"])
+        chapter["no"] = index + 1
+    return chapters
+
+
+def load_sidecar(target: str) -> tuple[Path, dict]:
+    """接受目录或单个 json；返回 (sidecar 路径, 数据)。"""
+    path = Path(target).expanduser().resolve()
+    if path.is_dir():
+        files = [p for p in path.glob("*.json") if p.parent.name != "media"]
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for file in files:
+            try:
+                data = json.loads(file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(data, dict) and "segments" in data:
+                return file, data
+        raise RuntimeError(f"{path} 里没有找到转写结果（*.json）")
+    if not path.exists():
+        raise RuntimeError(f"找不到 {path}")
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def render_publish(side: dict, chapters: list[dict]) -> str:
+    segments = side.get("segments") or []
+    chars = sum(len(s.get("text") or "") for s in segments)
+    head = [f"# {side.get('title') or '未命名'}", ""]
+    platform = PLATFORM_NAMES.get(str(side.get("platform") or ""), side.get("platform") or "")
+    facts = [x for x in (platform, side.get("author"), side.get("published")) if x]
+    if side.get("duration"):
+        facts.append(ts_long(side["duration"]))
+    if facts:
+        head.append("> " + " · ".join(facts))
+    if side.get("url"):
+        head.append(f"> {side['url']}")
+    lines = head + [""]
+    if side.get("description"):
+        lines += ["## 发布文案", "", (side["description"] or "").strip(), ""]
+    if len(chapters) > 1:
+        lines += ["## 章节", ""]
+        lines += [f"- `{ts_long(c['start'])}` {c['title']}" for c in chapters]
+        lines += [""]
+        lines += ["## 正文", ""]
+        for chapter in chapters:
+            lines += [f"### {ts_long(chapter['start'])} · {chapter['title']}", "",
+                      chapter["text"].strip(), ""]
+    elif chapters:
+        # 单段视频不切章节，按停顿分自然段更好读
+        lines += ["## 正文", ""]
+        for para in paragraphs(segments, gap=1.2, max_chars=220):
+            lines += [para["text"].strip(), ""]
+        if side.get("note"):
+            lines += [f"> {side['note']}", ""]
+    elif side.get("note"):
+        lines += [f"> {side['note']}", ""]
+    lines += ["---", ""]
+    foot = [f"共 {len(segments)} 句", f"{chars} 字"]
+    if side.get("duration"):
+        foot.append(f"语速 {round(chars / max(side['duration'] / 60, 0.01))} 字/分")
+    if side.get("backend"):
+        foot.append(f"转写 {side['backend']}")
+    lines += ["*" + " · ".join(foot) + "*", ""]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_script(chapters: list[dict]) -> str:
+    """纯口播稿：无时间戳、无小标题，直接可发给编辑。"""
+    blocks = [c["text"].strip() for c in chapters if c["text"].strip()]
+    return "\n\n".join(blocks) + "\n" if blocks else ""
+
+
+def render_chapters(chapters: list[dict], segments: list[dict]) -> str:
+    """章节 + 逐句时间轴，适合做视频简介或章节化字幕。"""
+    lines = ["## 章节", ""]
+    lines += [f"- `{ts_long(c['start'])}` {c['title']}" for c in chapters]
+    lines += ["", "## 时间轴", ""]
+    lines += [f"- `{ts_long(s['start'])}–{ts_long(s['end'])}` {s['text']}" for s in segments]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def find_sidecar(dir_path: Path) -> tuple[Path, dict]:
+    files = [p for p in dir_path.glob("*.json") if p.name != "media.json" and "media" not in p.parts]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for file in files:
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("segments"):
+            return file, data
+    raise RuntimeError("目录里没有带时间轴的转写结果")
+
+
+def realign_dir(target: str, model: str | None = None) -> Path:
+    """对已有结果补做句级对齐：用本地词级时间重算每句起止，不重新转写。"""
+    path = Path(target).expanduser().resolve()
+    if not path.is_dir():
+        raise RuntimeError(f"不是目录：{path}")
+    sidecar_path, side = find_sidecar(path)
+    segments = side.get("segments") or []
+    if len(segments) < 1:
+        raise RuntimeError("没有可对齐的句子")
+    media = Path(side.get("media") or "")
+    if not media.exists():
+        candidate = path / "media" / "media.mp4"
+        if candidate.exists():
+            media = candidate
+        else:
+            alt = path / "media" / "media.wav"
+            media = alt if alt.exists() else media
+    if not media.exists():
+        raise RuntimeError("找不到媒体文件（媒体可能已被保留策略清理）")
+    work = path / ".realign"
+    work.mkdir(parents=True, exist_ok=True)
+    wav = work / "audio16k.wav"
+    ffmpeg_to_wav(media, wav, None)
+    log(f"[align] 词级时间（{len(segments)} 句）…")
+    aligned = align_segments(segments, wav, work, model or cfg("ALIGN_MODEL") or cfg("MODEL") or None)
+    side["segments"] = aligned
+    side["aligned"] = True
+    sidecar_path.write_text(json.dumps(side, ensure_ascii=False, indent=1), encoding="utf-8")
+    stem = sidecar_path.stem
+    (path / f"{stem}.srt").write_text(
+        "\n".join(f"{i+1}\n{srt_ts(s['start'])} --> {srt_ts(s['end'])}\n{s['text']}\n"
+                  for i, s in enumerate(aligned)), encoding="utf-8")
+    shutil.rmtree(work, ignore_errors=True)
+    log(f"[align] 完成，已更新 {sidecar_path.name}")
+    return sidecar_path
+
+
+def export_doc(target: str, fmt: str, out_dir: str | None = None) -> Path:
+    """把已有转写结果再导出成发布稿 / 纯文案 / 章节 / 字幕 / 打包。"""
+    side_path, side = load_sidecar(target)
+    if fmt not in EXPORT_FORMATS:
+        raise RuntimeError(f"未知格式 {fmt}（可选 {', '.join(EXPORT_FORMATS)}）")
+    segments = side.get("segments") or []
+    stem = slugify(side.get("title") or "untitled")
+    dest_dir = Path(out_dir).expanduser().resolve() if out_dir and out_dir not in ("", ".") \
+        else side_path.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    chapters = chapterize(segments)
+    if fmt == "publish":
+        dest = dest_dir / f"{stem}.publish.md"
+        dest.write_text(render_publish(side, chapters), encoding="utf-8")
+    elif fmt == "script":
+        dest = dest_dir / f"{stem}.script.txt"
+        dest.write_text(render_script(chapters), encoding="utf-8")
+    elif fmt == "chapters":
+        dest = dest_dir / f"{stem}.chapters.md"
+        dest.write_text(render_chapters(chapters, segments), encoding="utf-8")
+    elif fmt == "srt":
+        dest = dest_dir / f"{stem}.srt"
+        dest.write_text(
+            "\n".join(f"{i + 1}\n{srt_ts(s['start'])} --> {srt_ts(s['end'])}\n{s['text']}\n"
+                      for i, s in enumerate(segments)), encoding="utf-8")
+    else:
+        dest = dest_dir / f"{stem}.bundle.zip"
+        staged = {
+            f"{stem}.publish.md": render_publish(side, chapters),
+            f"{stem}.script.txt": render_script(chapters),
+            f"{stem}.chapters.md": render_chapters(chapters, segments),
+            f"{stem}.srt": "\n".join(
+                f"{i + 1}\n{srt_ts(s['start'])} --> {srt_ts(s['end'])}\n{s['text']}\n"
+                for i, s in enumerate(segments)),
+            f"{stem}.json": json.dumps(side, ensure_ascii=False, indent=1),
+        }
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, body in staged.items():
+                zf.writestr(name, body)
+    log(f"exported: {dest}")
+    return dest
+
+
+# ---------------------------------------------------------------- main
+
+def wechat_cookie_status() -> tuple[bool, str]:
+    cookie = cfg("WX_YUANBAO_COOKIE")
+    source = "配置"
+    if cookie.startswith("@"):
+        path = Path(cookie[1:]).expanduser()
+        cookie = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+        source = str(path)
+    if not cookie:
+        cached = video2text_cache() / "yuanbao.cookie"
+        if cached.exists():
+            cookie = cached.read_text(encoding="utf-8").strip()
+            source = str(cached)
+    if not cookie:
+        return False, "未登录（运行 --login-wechat 扫码）"
+    names = {part.split("=", 1)[0].strip() for part in cookie.split(";") if "=" in part}
+    if not (names & {"hy_user", "hy_token", "hy_userid"}):
+        return False, "Cookie 里没有会话字段，可能需要重扫"
+    return True, f"登录态已保存（{source}）"
+
+
+def xhs_cookie_status() -> tuple[bool, str]:
+    if cfg("XHS_COOKIE"):
+        return True, "Cookie 已配置"
+    return False, "未登录（小红书多数内容无需登录）"
+
+
+def model_cache_info() -> dict:
+    home = Path(os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface"))
+    models = []
+    hub = home / "hub"
+    if hub.exists():
+        for entry in sorted(hub.iterdir()):
+            if entry.is_dir() and entry.name.startswith("models--"):
+                models.append(entry.name[len("models--"):].replace("--", "/"))
+    total = 0
+    if home.exists():
+        for file in home.rglob("*"):
+            try:
+                if file.is_file():
+                    total += file.stat().st_size
+            except OSError:
+                pass
+    return {"path": str(home), "bytes": total, "models": models}
+
+
+def warm_model(model: str) -> int:
+    """用 1 秒静音跑一遍指定模型，把权重下到本地缓存（进度直接走 stderr）。"""
+    model = model or cfg("ALIGN_MODEL") or cfg("MODEL") or "mlx-community/whisper-large-v3-turbo"
+    work = Path(tempfile.mkdtemp(prefix="v2t-warm-"))
+    wav = work / "silence.wav"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "anullsrc=r=16000:cl=mono", "-t", "1", str(wav)], check=True)
+    exe = ["mlx_whisper"] if have("mlx_whisper") else ["uvx", "--from", "mlx-whisper", "mlx_whisper"]
+    log(f"准备模型 {model}（首次会下载权重，进度见下方）…")
+    p = subprocess.run(exe + [str(wav), "--model", model, "--output-format", "json",
+                              "--output-dir", str(work / "out"), "--task", "transcribe",
+                              "--verbose", "False", "--language", "zh"])
+    shutil.rmtree(work, ignore_errors=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"模型准备失败（exit {p.returncode}）")
+    info = model_cache_info()
+    log(f"模型就绪 · 缓存 {round(info['bytes'] / 1e9, 2)} GB · {info['path']}")
+    return 0
+
+
+def check_status() -> int:
+    info = {"config": str(CONFIG_PATH), "config_exists": CONFIG_PATH.exists()}
+    info["douyin_login"] = douyin_cookie_status()
+    douk = cfg("DOUK_PATH")
+    info["douk_path"] = {"path": douk, "exists": bool(douk and Path(douk).exists())}
+    api = cfg("XHS_API") or "http://127.0.0.1:5556"
+    try:
+        req = urllib.request.Request(api + "/docs", method="GET")
+        with _open(req, 3) as r:
+            info["xhs_api"] = {"url": api, "ok": r.status < 500}
+    except Exception as e:
+        info["xhs_api"] = {"url": api, "ok": False, "error": str(e)[:80]}
+    xok, xmsg = xhs_cookie_status()
+    info["xhs_login"] = {"ok": xok, "detail": xmsg}
+    wok, wmsg = wechat_cookie_status()
+    cache = video2text_cache()
+    info["wechat_login"] = {"ok": wok, "detail": wmsg,
+                            "source": "cookie" if wok else ""}
+    info["wechat_session"] = {
+        "profile": str(cache / "chrome-profile"),
+        "exists": (cache / "chrome-profile").exists(),
+        "ok": wok or (cache / "chrome-profile").exists(),
+        "detail": "可用扫码会话解析（--wechat-session）" if (cache / "chrome-profile").exists()
+        else "无浏览器会话，只能靠 Cookie",
+    }
+    info["model_cache"] = model_cache_info()
+    info["asr"] = {"provider": cfg("ASR_PROVIDER") or "local",
+                   "model": cfg("ASR_MODEL") or "",
+                   "key": bool(cfg("ASR_API_KEY"))}
+    print(json.dumps(info, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _batch_cmd(url: str, args) -> list[str]:
+    cmd = [sys.executable, str(Path(__file__).resolve()), url, "--out", str(Path(args.out))]
+    pairs = (("--model", args.model), ("--backend", args.backend), ("--lang", args.lang),
+             ("--glossary", args.glossary), ("--fix", args.fix),
+             ("--cookies-from-browser", args.cookies_from_browser),
+             ("--cookies-file", args.cookies_file),
+             ("--login-timeout", args.login_timeout),
+             ("--chunk-seconds", args.chunk_seconds),
+             ("--asr-retries", args.asr_retries))
+    for flag, val in pairs:
+        if val not in (None, ""):
+            cmd += [flag, str(val)]
+    if args.max_seconds:
+        cmd += ["--max-seconds", str(args.max_seconds)]
+    if args.polish:
+        cmd.append("--polish")
+    if args.wechat_session:
+        cmd.append("--wechat-session")
+    return cmd
+
+
+def _batch_one(url: str, args) -> tuple[str, bool, str]:
+    p = run(_batch_cmd(url, args))
+    if p.returncode == 0:
+        lines = (p.stdout or "").strip().splitlines()
+        return url, True, lines[-1] if lines else ""
+    lines = (p.stderr or "").strip().splitlines()
+    return url, False, lines[-1] if lines else "failed"
+
+
+def _url_key(url: str) -> str:
+    return hashlib.sha1(url.encode()).hexdigest()[:16]
+
+
+def _load_state(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+def run_batch(args) -> int:
+    path = Path(args.batch).expanduser()
+    urls = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    if not urls:
+        log("清单为空")
+        return 2
+    outdir = Path(args.out)
+    state_path = outdir / ".batch-state.json"
+    state = _load_state(state_path) if args.resume else {}
+    todo = [u for u in urls if not (args.resume and state.get(_url_key(u), {}).get("ok"))]
+    skipped = len(urls) - len(todo)
+    if skipped:
+        log(f"断点续跑：跳过 {skipped} 条已完成")
+
+    ok = fail = 0
+
+    def record(url: str, good: bool, detail: str) -> None:
+        state[_url_key(url)] = {"url": url, "ok": good, "detail": detail,
+                                "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+        _save_state(state_path, state)
+
+    if args.jobs <= 1:
+        for i, url in enumerate(todo, 1):
+            log(f"[{i}/{len(todo)}] {url}")
+            _, good, detail = _batch_one(url, args)
+            record(url, good, detail)
+            ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
+            log(f"  {'ok  ' if good else 'fail'} {detail}")
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures = {pool.submit(_batch_one, u, args): u for u in todo}
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                url, good, detail = fut.result()
+                record(url, good, detail)
+                ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
+                log(f"[{done}/{len(todo)}] {'ok  ' if good else 'fail'} {url}")
+                log(f"       {detail}")
+    print(json.dumps({"total": len(urls), "ok": ok, "fail": fail, "skipped": skipped},
+                     ensure_ascii=False))
+    return 0 if fail == 0 else 3
+
+
+def probe(url: str, cookies_from_browser: str | None = None,
+          cookies_file: str | None = None) -> dict:
+    platform, ident = detect(url)
+    out = {"url": url, "platform": platform, "title": "", "author": "",
+           "published": "", "duration": 0.0, "cover": "", "hasVideo": True}
+    if platform == "douyin":
+        item = douyin_item(url)
+        video = item.get("video") or {}
+        out.update({
+            "title": (item.get("desc") or "").splitlines()[0][:80],
+            "author": (item.get("author") or {}).get("nickname", ""),
+            "published": time.strftime("%Y-%m-%d", time.localtime(item["create_time"])) if item.get("create_time") else "",
+            "duration": round((video.get("duration") or 0) / 1000, 1),
+            "cover": ((video.get("cover") or {}).get("url_list") or [""])[0],
+            "platform": "抖音",
+        })
+    elif platform == "xiaohongshu":
+        data = xhs_data(url)
+        urls = [u for u in (data.get("下载地址") or []) if u]
+        out.update({
+            "title": (data.get("作品标题") or (data.get("作品描述") or "").splitlines()[0])[:80],
+            "author": data.get("作者昵称", ""),
+            "published": (data.get("发布时间") or "")[:10].replace("_", " "),
+            "cover": data.get("封面地址", ""),
+            "platform": "小红书",
+            "hasVideo": bool(urls),
+        })
+    elif platform == "wechat":
+        meta = wechat_meta(ident)
+        out.update({"title": meta.get("title", ""), "author": meta.get("author", ""),
+                    "published": meta.get("published", ""), "cover": meta.get("cover", ""),
+                    "platform": "微信视频号"})
+    else:
+        meta = yt_meta(ident, cookies_from_browser or "", cookies_file or "")
+        out.update({"title": meta.get("title", ""), "author": meta.get("author", ""),
+                    "published": meta.get("published", ""),
+                    "duration": float(meta.get("duration") or 0),
+                    "cover": meta.get("thumbnail", ""), "platform": meta.get("platform", "")})
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="video2text", description=__doc__)
+    ap.add_argument("url", nargs="?", help="视频链接（或配合 --from-file）")
+    ap.add_argument("--from-file", help="本地音视频/录屏文件，跳过下载")
+    ap.add_argument("--out", default=".", help="输出目录 (default: .)")
+    ap.add_argument("--lang", default="zh", help="ASR 语言 (default: zh)")
+    ap.add_argument("--model", help="ASR 模型")
+    ap.add_argument("--backend", default="auto", choices=["auto", "mlx", "whispercpp", "api"])
+    ap.add_argument("--cookies-from-browser", help="如 chrome / safari，用于抖音/小红书")
+    ap.add_argument("--cookies-file", help="Netscape 格式 cookie 文件（抖音/小红书 403 时用）")
+    ap.add_argument("--cookie", help="视频号：腾讯元宝(yuanbao.tencent.com)登录后的 Cookie；@file 从文件读")
+    ap.add_argument("--login-wechat", action="store_true", help="打开浏览器扫码登录腾讯元宝，保存 Cookie 后退出")
+    ap.add_argument("--login", choices=["douyin", "xhs"], help="扫码登录抖音/小红书，Cookie 写入固定配置")
+    ap.add_argument("--wechat-session", action="store_true",
+                    help="视频号：开浏览器扫码登录，登录态内直接解析（Cookie 只作兜底）")
+    ap.add_argument("--login-timeout", type=int, default=240, help="登录等待秒数 (default 240)")
+    ap.add_argument("--max-seconds", type=float, help="只转写前 N 秒（试跑用）")
+    ap.add_argument("--batch", help="清单文件，每行一个链接（# 开头忽略）")
+    ap.add_argument("--ocr-limit", type=int, default=None, help="图文 OCR 最多处理几张图（0 关闭，默认取配置 12）")
+    ap.add_argument("--resume", action="store_true", help="断点续跑：跳过 .batch-state.json 里已成功的条目")
+    ap.add_argument("--jobs", type=int, default=1, help="批量并发数 (default 1，平台风控建议保持串行)")
+    ap.add_argument("--status", action="store_true", help="检查配置/登录态/本地服务是否就绪")
+    ap.add_argument("--warm-model", nargs="?", const="", default=None,
+                    help="预下载/预加载本地模型后退出（可选模型名）")
+    ap.add_argument("--config-show", action="store_true", help="打印配置（密钥打码）")
+    ap.add_argument("--reveal", action="store_true", help="配合 --config-show：原样输出密钥")
+    ap.add_argument("--config-merge", action="store_true", help="从 stdin 读 JSON 合并进固定配置")
+    ap.add_argument("--realign", help="对已转写的目录补做句级对齐（不重新转写）")
+    ap.add_argument("--export", help="从已转写目录（或 *.json）再导出发布稿，配合 --format")
+    ap.add_argument("--format", default="publish", choices=EXPORT_FORMATS,
+                    help="导出格式：publish 发布稿 / script 纯口播 / chapters 章节 / srt 字幕 / bundle 打包")
+    ap.add_argument("--probe", action="store_true", help="只取元数据（封面/标题/时长），不下载不转写")
+    ap.add_argument("--asr-retries", type=int, default=3, help="云端 ASR 单分片重试次数 (default 3)")
+    ap.add_argument("--chunk-seconds", type=int, default=None,
+                    help="云端 ASR 分片目标长度，在静音处切（默认取配置 chunk_seconds，否则 120s）")
+    ap.add_argument("--fix", default="", help="转写后替换，如 \"日曼=日耳曼,飘航=飘扬\"；比 initial_prompt 稳")
+    ap.add_argument("--polish", action="store_true", help="用 LLM 纠错+断句，生成 <标题>.polished.md")
+    ap.add_argument("--glossary", default="", help="术语表，逗号分隔，供 --polish 参考")
+    ap.add_argument("--align", action="store_true", help="云端转写后用本地词级时间对齐到句级")
+    ap.add_argument("--no-align", action="store_true", help="显式不对齐（压过配置里的 align）")
+    ap.add_argument("--media-dir", help="把媒体复制到指定目录（供播放器使用）")
+    ap.add_argument("--keep-audio", action="store_true")
+    ap.add_argument("--json", action="store_true", help="stdout 输出 JSON")
+    args = ap.parse_args()
+    if args.chunk_seconds is None:
+        args.chunk_seconds = cfg_int("chunk_seconds", 120)
+    # YouTube / 部分站点要登录态：没传参时读配置
+    if not args.cookies_from_browser:
+        args.cookies_from_browser = cfg("cookies_from_browser") or None
+    if not args.cookies_file:
+        args.cookies_file = cfg("cookies_file") or None
+
+    needs_auth = ""
+
+    if args.status:
+        return check_status()
+
+    if args.warm_model is not None:
+        try:
+            return warm_model(args.warm_model)
+        except Exception as e:
+            log(f"model error: {e}")
+            return 2
+
+    if args.config_show:
+        return config_show(bool(args.reveal))
+
+    if args.config_merge:
+        try:
+            print(config_merge())
+            return 0
+        except Exception as e:
+            log(f"config error: {e}")
+            return 2
+
+    if args.realign:
+        try:
+            print(realign_dir(args.realign, args.model))
+            return 0
+        except Exception as e:
+            log(f"realign error: {e}")
+            return 2
+
+    if args.export:
+        try:
+            print(export_doc(args.export, args.format, args.out))
+            return 0
+        except Exception as e:
+            log(f"export error: {e}")
+            return 2
+
+    if args.probe:
+        if not args.url:
+            ap.error("--probe 需要 URL")
+        try:
+            print(json.dumps(probe(args.url, args.cookies_from_browser, args.cookies_file),
+                             ensure_ascii=False))
+            return 0
+        except Exception as e:
+            log(f"probe error: {e}")
+            return 2
+
+    if args.login:
+        try:
+            print(site_login(args.login, args.login_timeout))
+            return 0
+        except Exception as e:
+            log(f"login error: {e}")
+            return 2
+
+    if args.login_wechat:
+        try:
+            path = wechat_login(args.login_timeout)
+            print(path)
+            return 0
+        except Exception as e:
+            log(f"login error: {e}")
+            return 2
+
+    if args.batch:
+        return run_batch(args)
+
+    if not args.url and not args.from_file:
+        ap.error("需要 URL、--from-file 或 --batch")
+
+    outdir = Path(args.out).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    work = outdir / ".video2text" / uuid.uuid4().hex[:8]
+    work.mkdir(parents=True, exist_ok=True)
+
+    platform, ident = detect(args.url) if args.url else ("file", args.from_file)
+    if platform == "file":
+        log("[1/3] 本地文件：抽 16k 单声道…")
+    meta: dict = {"platform": platform, "title": Path(args.from_file).stem if args.from_file else "", "url": args.url or ""}
+    note = ""
+    wav: Path | None = None
+    media_src: Path | None = None
+
+    try:
+        if args.from_file:
+            meta["title"] = meta["title"] or "local"
+            src = Path(args.from_file).expanduser()
+            if src.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv", ".m4v"):
+                media_src = src
+            wav = work / "audio16k.wav"
+            ffmpeg_to_wav(src, wav, args.max_seconds)
+        elif platform == "douyin" and cfg("DOUK_PATH") and cfg("DOUYIN_COOKIE"):
+            log("[1/3] 抖音：走 DouK 签名 + 登录态…")
+            meta, video = douyin_fetch(ident, work)
+            media_src = video
+            wav = work / "audio16k.wav"
+            ffmpeg_to_wav(video, wav, args.max_seconds)
+        elif platform == "xiaohongshu" and (cfg("XHS_API") or "127.0.0.1:5556"):
+            try:
+                log("[1/3] 小红书：走本地 XHS-Downloader 服务…")
+                meta, video = xhs_api_fetch(ident, work, [ocr_limit(args.ocr_limit)])
+                note = "" if video else "图文/无视频作品，只输出发布文案。"
+                if video:
+                    media_src = video
+                    wav = work / "audio16k.wav"
+                    ffmpeg_to_wav(video, wav, args.max_seconds)
+            except Exception as e:
+                log(f"[1/3] XHS 服务不可用（{e}），回退 yt-dlp…")
+                meta = yt_meta(ident, args.cookies_from_browser, args.cookies_file)
+                wav, _ = yt_download_audio(ident, work, args.cookies_from_browser,
+                                           args.max_seconds, args.cookies_file)
+        elif platform == "wechat":
+            cookie = (args.cookie or os.environ.get("WX_YUANBAO_COOKIE", "")) \
+                if args.wechat_session else wechat_cookie(args)
+            if cookie or args.wechat_session:
+                if args.wechat_session:
+                    log("[1/3] 视频号：复用登录态解析（必要时会弹窗扫码）")
+                else:
+                    log("[1/3] 视频号：用 Cookie 走元宝解析")
+                meta, wav = wechat_full(ident, cookie or None, work, args.login_timeout)
+                media_src = Path(meta.get("media_path") or "") if meta.get("media_path") else None
+                note = ""
+            else:
+                log("[auth:wechat] 未检测到视频号登录态，只取到发布文案")
+                meta = wechat_meta(ident)
+                needs_auth = "wechat"
+                note = ("视频号需要登录腾讯元宝才能取媒体与口播稿；"
+                        "当前只拿到发布文案。登录后重跑即可全自动。")
+        else:
+            log("[1/3] yt-dlp：取元数据…")
+            meta = yt_meta(ident, args.cookies_from_browser, args.cookies_file)
+            log("[2/3] 下载音轨…")
+            wav, src_media = yt_download_audio(ident, work, args.cookies_from_browser,
+                                               args.max_seconds, args.cookies_file,
+                                               video=bool(args.media_dir))
+            media_src = src_media
+    except Exception as e:
+        log(f"error: {e}")
+        return 2
+
+    # 媒体与元数据先落盘：播放器不必等转写结束
+    duration = audio_duration(wav) if wav else 0.0
+    media_path = ""
+    if args.media_dir and wav:
+        dest_dir = Path(args.media_dir).expanduser().resolve()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        if media_src and Path(media_src).exists():
+            dest = dest_dir / ("media" + Path(media_src).suffix.lower())
+            shutil.copy2(media_src, dest)
+        else:
+            dest = dest_dir / "media.wav"
+            shutil.copy2(wav, dest)
+        media_path = str(dest)
+        early = {"title": meta.get("title", ""), "platform": meta.get("platform", ""),
+                 "author": meta.get("author", ""), "published": meta.get("published", ""),
+                 "url": meta.get("url", ""), "duration": round(duration, 2),
+                 "media": media_path, "cover": meta.get("cover") or meta.get("thumbnail") or "",
+                 "segments": [], "partial": True}
+        (outdir / "media.json").write_text(json.dumps(early, ensure_ascii=False, indent=1),
+                                           encoding="utf-8")
+        log(f"[media] ready {media_path}")
+
+    segments = None
+    if wav:
+        try:
+            backend = asr_backend(args.backend)
+            log(f"[3/3] 转写（{backend}"
+                + (f" · 分片 {args.chunk_seconds}s" if backend == "api" else "") + "）…")
+            fixes = dict(p.split("=", 1) for p in args.fix.split(",") if "=" in p)
+            if backend == "api":
+                segments = apply_fixes(
+                    asr_api_transcribe(wav, work, args.lang, args.chunk_seconds, args.asr_retries), fixes)
+            else:
+                segments = asr_transcribe(wav, backend, args.model, args.lang, work, fixes)
+            want_align = False if args.no_align else (args.align or cfg_bool("align", False))
+            if backend == "api" and segments and not want_align:
+                segments = interpolate_sentences(segments)
+                log("[3/3] 按标点切句（时间在分片内插值，未做词级对齐）")
+            if want_align and backend == "api" and segments:
+                log("[3/3] 句级对齐（本地词级时间）…")
+                try:
+                    segments = apply_fixes(align_segments(segments, wav, work, args.model), fixes)
+                except Exception as e:
+                    log(f"align fallback: {e}")
+            meta["asr"] = backend
+            meta["segments"] = len(segments)
+        except Exception as e:
+            log(f"asr error: {e}")
+            note = (note + " " if note else "") + f"转写失败：{e}"
+
+    if segments:
+        chars = sum(len(x["text"]) for x in segments)
+        dur = segments[-1]["end"] if segments else 0
+        if chars < 20 and dur >= 5:
+            note = (note + " " if note else "") + "该视频几乎没有口播（纯展示/BGM），文案以上方「发布文案」为准。"
+
+    if not duration and wav:
+        duration = audio_duration(wav)
+    if args.media_dir and wav and not media_path:
+        dest_dir = Path(args.media_dir).expanduser().resolve()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / ("media" + Path(media_src).suffix.lower()) if media_src and Path(media_src).exists() \
+            else dest_dir / "media.wav"
+        shutil.copy2(media_src if dest.name != "media.wav" else wav, dest)
+        media_path = str(dest)
+
+    stem = slugify(meta.get("title", "untitled"))
+    md_path = outdir / f"{stem}.md"
+    md_path.write_text(render_md(meta, segments, note), encoding="utf-8")
+    if segments:
+        (outdir / f"{stem}.srt").write_text(
+            "\n".join(f"{i+1}\n{srt_ts(s['start'])} --> {srt_ts(s['end'])}\n{s['text']}\n"
+                      for i, s in enumerate(segments)), encoding="utf-8")
+    sidecar = {
+        "title": meta.get("title", ""), "platform": meta.get("platform", ""),
+        "author": meta.get("author", ""), "published": meta.get("published", ""),
+        "url": meta.get("url", ""), "duration": round(duration, 2),
+        "media": media_path, "media_kind": "video" if media_path and not media_path.endswith(".wav") else "audio",
+        "cover": meta.get("cover") or meta.get("thumbnail") or "",
+        "backend": meta.get("asr", ""), "note": note,
+        "description": meta.get("description", ""),
+        "stats": meta.get("stats") or {},
+        "aligned": bool(want_align) if "want_align" in locals() else False,
+        "segments": segments or [],
+    }
+    (outdir / f"{stem}.json").write_text(json.dumps(sidecar, ensure_ascii=False, indent=1), encoding="utf-8")
+    (outdir / "media.json").unlink(missing_ok=True)
+
+    if args.polish and segments:
+        body = "\n".join(p["text"] for p in paragraphs(segments))
+        prompt = build_polish_prompt(meta, body, args.glossary)
+        try:
+            polished = call_llm(prompt)
+            (outdir / f"{stem}.polished.md").write_text(polished, encoding="utf-8")
+            log(f"polished: {outdir / f'{stem}.polished.md'}")
+        except Exception as e:
+            (outdir / f"{stem}.prompt.md").write_text(prompt, encoding="utf-8")
+            log(f"polish skipped ({e}); prompt saved: {outdir / f'{stem}.prompt.md'}")
+
+    if not args.keep_audio:
+        shutil.rmtree(work, ignore_errors=True)
+    else:
+        log(f"audio kept: {work}")
+
+    if args.json:
+        print(json.dumps({"meta": meta, "segments": segments}, ensure_ascii=False, indent=1))
+    else:
+        print(md_path)
+    if needs_auth:
+        log(f"[auth:{needs_auth}] 需要登录后才能取到口播稿")
+        return 4
+    return 0 if segments or platform == "wechat" else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

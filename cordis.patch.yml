@@ -1,0 +1,4 @@
+# dsh-video2text：向组合挂 Node half（工具 + 面板数据路由）
+- insert:
+    - id: dsh-video2text
+      name: 'dsh-video2text'
