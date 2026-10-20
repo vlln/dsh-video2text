@@ -4,3 +4,6 @@ node_modules/
 out/
 .config/
 *.local.md
+
+# 原始录屏与导出物
+*.mov
