@@ -1,4 +1,4 @@
-<h1 align="center">dsh-video2text</h1>
+<h1 align="center"><img src="icon.svg" alt="" width="40" align="absmiddle"> dsh-video2text</h1>
 
 <p align="center">Paste a video link, get the publishing copy and a full spoken transcript. The plugin ships its own skill; the UI is one sidebar workbench.</p>
 
