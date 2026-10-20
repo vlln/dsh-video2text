@@ -6,6 +6,7 @@
   <a href="https://github.com/vlln/dsh-video2text/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/vlln/dsh-video2text?label=release"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/github/license/vlln/dsh-video2text"></a>
   <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.1-4C8DFF">
+  <a href="https://github.com/vlln/dsh-video2text/discussions"><img alt="discussions" src="https://img.shields.io/github/discussions/vlln/dsh-video2text"></a>
   <a href="README.en.md">English</a> · <b>中文</b>
 </p>
 
@@ -15,15 +16,9 @@
 
 抖音、小红书、微信视频号、B站、YouTube 的分享链接，变成发布文案、逐字稿、字幕和章节稿。媒体先落盘，转写没跑完就能先看片子。
 
+以前取一条视频的文案要开网页、复制简介、手动听写、自己排版；批量十条就是十次重复。插件把解析、下载、转写、对齐、排版收进侧栏，产物落在一个目录里，可以直接打开、导出，或交给 agent 继续加工。
+
 ![面板](docs/preview.png)
-
-## 30 秒上手
-
-1. 侧栏 **Plugins** → 添加插件 → 填 `github:vlln/dsh-video2text`，重启 `dsh web`
-2. 侧栏点「视频转文案」，贴一条 B 站链接，回车
-3. 几秒后出现任务卡和封面，转写完成后点「导出 → 发布稿」
-
-取文案这件事本来要：打开网页 → 复制简介 → 手动听写或跑一遍转写 → 自己排版。批量十条就是十次重复劳动，还容易漏掉时间轴。插件把它收进侧栏，解析、下载、转写、对齐、排版都在本机完成，产物落在一个目录里，可以直接打开、导出，或者交给 agent 继续加工。
 
 ## 能做什么
 
@@ -48,7 +43,7 @@
 dsh plugin --profile web add "github:vlln/dsh-video2text"
 ```
 
-两条路径都在干净环境里验证过（dsh `0.2.1-rc.1`）。装完**重启 `dsh web`** —— Node half 在启动时注册，刷新页面不会出现面板。
+两条路径都在干净环境里验证过（dsh `0.2.1-rc.1`）。装完**重启 `dsh web`** —— Node half 在启动时注册，刷新页面不会出现面板。确认方法：侧栏出现「视频转文案」，贴一条 B 站链接回车，几秒内出现任务卡与封面；转写完成后「导出 → 发布稿」应下载一个 `.publish.md`。
 
 **运行环境**：
 
@@ -140,10 +135,8 @@ dsh plugin --profile web add "github:vlln/dsh-video2text"
 | 引擎配置（含密钥） | `~/.config/video2text/config.json`（600） |
 | 扫码会话 | `~/.cache/video2text/chrome-profile` 等 Chrome profile |
 
-- 密钥只在本机配置文件里，界面上默认隐藏。
-- 转写选「云端」时音频分片会上传到配置的 ASR 服务；选「本地」则不出本机。
-- 不向任何第三方上报使用数据。
-- 媒体默认按 14 天 / 5 GB 清理，只删媒体，文案和字幕保留。
+- 密钥只在本机配置文件里，界面默认隐藏；不向任何第三方上报使用数据。
+- 转写选「云端」时音频分片上传到配置的 ASR 服务，选「本地」不出本机。媒体默认按 14 天 / 5 GB 清理，只删媒体，文案和字幕保留。
 
 ## 常见问题
 
@@ -155,7 +148,6 @@ dsh plugin --profile web add "github:vlln/dsh-video2text"
 | 时间轴标着「估算」 | 没做过词级对齐。点「对齐」精修，只更新 json/srt，不重转 |
 | 导出按钮不见了 | 没有逐字稿（转写失败 / 无口播）时不显示导出菜单 |
 | 云端转写很慢 | 受服务端排队影响，与分片大小关系不大；可切「本地」后端 |
-| YouTube 报 bot 校验 | 家宽可用 PO token；机房 IP 必须 Cookie，见下 |
 | 小红书批量失败 | 本地 XHS-Downloader 没起（设置里有地址），会回退 yt-dlp |
 | 模型下载卡住 | 缓存在 `~/.cache/video2text/hf`；换 `-q4` 量化模型更快 |
 
@@ -171,31 +163,20 @@ YouTube 对无登录态请求返回 `Sign in to confirm you're not a bot`。社�
 
 ## 已知限制
 
-- 视频号依赖腾讯元宝的登录态；失效后进入「需要登录」，重扫即可。
-- 抖音依赖 DouK-Downloader 与本机 Cookie；小红书依赖本地 XHS-Downloader 服务（没起会回退 yt-dlp，覆盖变少）。
+- 平台登录态会过期：视频号（元宝）、抖音（DouK + Cookie）、小红书（本地 XHS-Downloader）。失效时任务进入「需要登录」，卡片上扫码即可。
 - 长视频的云端转写受服务端排队影响（16 分钟视频约 4 分钟），分片大小不是瓶颈。
 - 一个平台一份登录态，暂不支持多账号并存。
 - 只在 dsh `0.2.1-rc.1` 上验证通过，其它版本未验证。
-
-## 装好之后怎么确认
-
-1. 侧栏出现「视频转文案」，点进去能看到输入框与任务列表。
-2. 贴一条 B 站链接回车：几秒内出现任务卡与封面，随后能看到播放器。
-3. 转写完成点「导出 → 发布稿」，应下载一个 `.publish.md`。
 
 卸载：`dsh plugin --profile web remove dsh-video2text`，再重启 `dsh web`。
 
 ## 与 skill 的关系
 
-插件自带 `skills/video2text`，首次加载时软链到 `$DSH_HOME/skills/video2text`，agent 通过常规 skill 发现路径读到它 —— 不给 agent 新增工具。skill 本身可脱离 dsh 单独用：
-
-```sh
-python3 scripts/video2text <url> --out ./out
-```
+插件自带 `skills/video2text`，首次加载软链到 `$DSH_HOME/skills/video2text`，agent 通过常规发现路径读到它 —— 不给 agent 新增工具。skill 也能脱离 dsh 单独用：`python3 scripts/video2text <url> --out ./out`。
 
 ## 参与开发
 
-见 [docs/development.md](docs/development.md)（本地 link 调试、内置 skill 同步、发版流程）。
+有问题、想法或使用场景，去 [Discussions](https://github.com/vlln/dsh-video2text/discussions) 说；本地调试与发版见 [docs/development.md](docs/development.md)。
 
 ## 许可
 

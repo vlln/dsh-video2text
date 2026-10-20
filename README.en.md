@@ -6,6 +6,7 @@
   <a href="https://github.com/vlln/dsh-video2text/releases/latest"><img alt="version" src="https://img.shields.io/github/v/release/vlln/dsh-video2text?label=release"></a>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/github/license/vlln/dsh-video2text"></a>
   <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.1-4C8DFF">
+  <a href="https://github.com/vlln/dsh-video2text/discussions"><img alt="discussions" src="https://img.shields.io/github/discussions/vlln/dsh-video2text"></a>
   <b>English</b> · <a href="README.md">中文</a>
 </p>
 
