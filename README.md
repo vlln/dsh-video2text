@@ -2,6 +2,17 @@
 
 <p align="center">粘贴视频链接，得到「发布文案 + 口播逐字稿」。插件自带 skill，界面上是一个侧栏工作台。</p>
 
+<p align="center">
+  <a href="https://github.com/vlln/dsh-video2text/releases/latest"><img alt="version" src="https://img.shields.io/github/v/release/vlln/dsh-video2text?label=release"></a>
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/github/license/vlln/dsh-video2text"></a>
+  <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.1-4C8DFF">
+  <a href="README.en.md">English</a> · <b>中文</b>
+</p>
+
+<p align="center"><img src="docs/demo.gif" alt="演示" width="820"></p>
+
+<p align="center"><a href="https://github.com/vlln/dsh-video2text/releases/download/v0.1.0/demo.mp4">▶ 看完整演示（27 秒，877 KB）</a></p>
+
 ![面板](docs/preview.png)
 
 抖音、小红书、微信视频号、B站、YouTube 的分享链接 → 发布文案、逐字稿、字幕、章节稿。转写默认走云端（更快更准），也可以整条切成本地；媒体先落盘，转写没跑完就能先看片子。
@@ -17,6 +28,12 @@
 深色主题跟随系统：
 
 ![深色](docs/preview-dark.png)
+
+## 30 秒上手
+
+1. 侧栏 **Plugins** → 添加插件 → `github:vlln/dsh-video2text`，重启 `dsh web`
+2. 侧栏点「视频转文案」，贴一条 B 站链接，回车
+3. 几秒后出现任务卡 + 封面；转写完成后点「导出 → 发布稿」
 
 ## 安装
 
@@ -158,56 +175,15 @@ dsh plugin --profile web add "github:vlln/dsh-video2text"
 
 ## YouTube 的 bot 校验怎么解
 
-YouTube 从 2025 起对无登录态请求返回 `Sign in to confirm you're not a bot`。社区（[PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide) 与 [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)）的解法是 **PO token**，由「provider 造 token」+「yt-dlp 插件交 token」两部分组成。
-
-### 装法（本机实测通过）
-
-```sh
-# 1) provider（Docker，端口 4416，只绑回环）
-docker run --name bgutil-provider -d --init \
-  -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
-
-# 2) yt-dlp 插件（放用户插件目录；对本机 uvx 装的 yt-dlp 生效）
-mkdir -p ~/.config/yt-dlp/plugins
-curl -sL -o /tmp/pot.zip \
-  https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/latest/download/bgutil-ytdlp-pot-provider.zip
-unzip -oq /tmp/pot.zip -d ~/.config/yt-dlp/plugins/bgutil-ytdlp-pot-provider
-```
-
-> 注意：`~/Library/Application Support/yt-dlp/plugins` 在 `uvx` 装的 yt-dlp 上**不会被发现**（实测 `Plugin directories: none`），要放 `~/.config/yt-dlp/plugins`。插件放别处时，用配置项 `yt_plugin_dirs` 指定目录（引擎会传 `--plugin-dirs`）。
-
-把 provider 地址填进「设置 → YouTube PO token」（默认就是 `http://127.0.0.1:4416`），引擎会传：
-
-```
---extractor-args "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"
-```
-
-### 怎么确认插件真的在工作
-
-```sh
-yt-dlp -v --simulate --extractor-args "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416" <url>
-```
-
-输出要有这两行（第一行说明插件加载了，第二行说明 token 真的被请求了）：
-
-```
-[youtube] [pot] PO Token Providers: bgutil:http-2.0.2 (external), …
-[youtube] [pot:bgutil:http] Generating a gvs PO Token for web client via bgutil HTTP server
-```
-
-### 它救不了什么
-
-provider 的 README 写得很明确：**PO token 不绕过 IP 级的登录限制**。如果只有第一行、没有第二行（token 流程根本没触发），说明请求在更早的 `LOGIN_REQUIRED` 就被拒了，通常是出口 IP 被判定为机房。
-
-本机（机房出口）实测：插件 + provider 都装好、provider `/ping` 返回 200、`PO Token Providers: bgutil:http-2.0.2` 正常列出，但**七种 player_client 全部在 token 之前被拦**；同时这台机器没有 Chrome 配置（`--cookies-from-browser chrome` 报找不到 cookie 库），所以 Cookie 这条路也不可用。
-
-结论按网络环境选：
+YouTube 对无登录态请求返回 `Sign in to confirm you're not a bot`。社区解法是 PO token（provider 造 token + yt-dlp 插件交付），本机实测的结论：
 
 | 网络 | 该用什么 |
 |---|---|
-| 家宽 / 普通出口 | PO token（上面两步），多半就通了 |
-| 机房 IP / 代理出口 | 必须 Cookie；token 只能缓解，不能绕过 |
-| 临时看一条 | `--cookies-from-browser chrome` 最快 |
+| 家宽 / 普通出口 | PO token：起 provider + 装 `bgutil-ytdlp-pot-provider` 插件（[详细步骤](docs/youtube.md)） |
+| 机房 IP / 代理出口 | **必须 Cookie**（设置 → 浏览器 Cookie 填 `chrome`），PO token 不绕过 IP 级限制 |
+| 临时看一条 | 直接 `--cookies-from-browser chrome` 最快 |
+
+判断插件是否真的在工作：`yt-dlp -v` 输出里既要有 `PO Token Providers: bgutil:http-…`，也要有 `Generating a gvs PO Token …`；只有前者说明请求在更早的 `LOGIN_REQUIRED` 就被拒了。
 
 ## 装好之后怎么确认
 
@@ -223,8 +199,22 @@ provider 的 README 写得很明确：**PO token 不绕过 IP 级的登录限制
 
 ## 开发
 
-把仓库放进 profile 的 `local/`，在 profile 的 `package.json` 里加一行 `"dsh-video2text": "link:.../local/dsh-video2text"`，并把它加进 `dsh.profile.bundles`；改完重启 `dsh web`（client 改动刷新即可）。
+把仓库放进 profile 的 `local/`，在 profile 的 `package.json` 里加 `"dsh-video2text": "link:.../local/dsh-video2text"` 并加进 `dsh.profile.bundles`；改完重启 `dsh web`（client 改动刷新即可）。内置 skill 是拷贝：`rsync -a --delete ../video2text/ skills/video2text/`。
 
 ## 许可
 
 MIT。运行时通过 HTTP/CLI 调用上游工具，不链接其代码：yt-dlp（Unlicense）、DouK-Downloader 与 XHS-Downloader（GPL-3.0）、bgutil-ytdlp-pot-provider（MIT）。
+
+## 常见问题
+
+| 症状 | 原因 / 处理 |
+|---|---|
+| 侧栏没有「视频转文案」 | 没重启 `dsh web`；或 boot 日志里有 `plugin tree failed to load`（依赖解析失败） |
+| 任务一直「需要登录」 | 对应平台登录态失效：点卡片上的「扫码登录」，完成后会自动重跑 |
+| 发布文案是空的 | 本地文件没有平台描述；或旧任务（当时没存 `description`），重跑一次即可 |
+| 字幕时间轴标着「估算」 | 没做过词级对齐。点「对齐」精修，只更新 json/srt，不重转 |
+| 导出按钮不见了 | 没有逐字稿（转写失败 / 无口播）时不出导出菜单 |
+| 云端转写很慢 | 受服务端排队影响，与分片大小关系不大；可切「本地」后端 |
+| YouTube 报 bot 校验 | 见上面「YouTube 的 bot 校验怎么解」；机房 IP 必须 Cookie |
+| 小红书一批失败 | 本地 XHS-Downloader 没起（设置里有地址）→ 会回退 yt-dlp，能拿到的内容变少 |
+| 模型下载卡住 | 模型缓存在 `~/.cache/video2text/hf`；换 `-q4` 量化模型更快，见「设置 → 本地模型」 |
