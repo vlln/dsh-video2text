@@ -2,6 +2,17 @@
 
 <p align="center">Paste a video link, get the publishing copy and a full spoken transcript. The plugin ships its own skill; the UI is one sidebar workbench.</p>
 
+<p align="center">
+  <a href="https://github.com/vlln/dsh-video2text/releases/latest"><img alt="version" src="https://img.shields.io/github/v/release/vlln/dsh-video2text?label=release"></a>
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/github/license/vlln/dsh-video2text"></a>
+  <img alt="dsh" src="https://img.shields.io/badge/dsh-0.2.1--rc.1-4C8DFF">
+  <b>English</b> · <a href="README.md">中文</a>
+</p>
+
+<p align="center"><img src="docs/demo.gif" alt="demo" width="820"></p>
+
+<p align="center"><a href="https://github.com/vlln/dsh-video2text/releases/download/v0.1.0/demo.mp4">▶ Full demo (27s, 877 KB)</a></p>
+
 ![Panel](docs/preview.png)
 
 Chinese-first, works for Douyin, Xiaohongshu, WeChat Channels, Bilibili and YouTube. Transcription runs in the cloud by default (faster, better Chinese punctuation) and can be switched entirely to local. The media is written to disk before transcription finishes, so you can watch while it runs.
@@ -65,7 +76,7 @@ The plugin bundles `skills/video2text` and symlinks it into `$DSH_HOME/skills/vi
 
 - WeChat Channels depends on a Tencent Yuanbao session; when it expires the task asks you to sign in again.
 - Douyin needs DouK-Downloader plus a local cookie; Xiaohongshu uses a local XHS-Downloader service (falls back to yt-dlp, with less coverage).
-- YouTube returns a bot check without a signed-in session: set a browser cookie, or run bgutil (`docker run -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider`) and put its URL into "YouTube PO token".
+- YouTube returns a bot check without a signed-in session: set a browser cookie, or run bgutil (`docker run -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider`) plus its yt-dlp plugin and put the URL into "YouTube PO token". A PO token does **not** bypass IP-level blocks — datacenter egress still needs cookies. Details: [docs/youtube.md](docs/youtube.md).
 - Long cloud transcriptions are dominated by server-side queueing (a 16-minute video took ~4 minutes); chunk size barely matters.
 - One session per platform; no multi-account support yet.
 
