@@ -10,9 +10,9 @@
   <b>English</b> · <a href="README.md">中文</a>
 </p>
 
-<p align="center"><img src="docs/demo.gif" alt="demo" width="680"></p>
+<p align="center"><a href="https://github.com/vlln/dsh-video2text/releases/download/v0.1.0/demo.mp4"><img src="docs/demo-poster.png" alt="demo (click to play)" width="680"></a></p>
 
-<p align="center"><a href="https://github.com/vlln/dsh-video2text/releases/download/v0.1.0/demo.mp4">▶ Full demo (17s, 1.1 MB)</a></p>
+<p align="center">▶ <a href="https://github.com/vlln/dsh-video2text/releases/download/v0.1.0/demo.mp4">Play the demo (17s, 1.1 MB)</a></p>
 
 ![Panel](docs/preview.png)
 
