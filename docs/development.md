@@ -49,9 +49,14 @@ node --check lib/index.mjs && node --check lib/client.js
 git commit -am "release: vX.Y.Z"
 git tag vX.Y.Z && git push origin main --tags
 
-# 3) 建 release（演示素材挂在这里，仓库里只留内联 GIF）
+# 3) 建 release
 gh release create vX.Y.Z --title "vX.Y.Z" --notes "…"
-gh release upload vX.Y.Z docs/demo.gif --clobber
+
+# 4) 演示视频：不要提交进仓库，也不要传 release；
+#    用 gh 的 --attach 传到 user-attachments，拿到原生播放器 URL
+gh issue comment <issue> --attach ~/Movies/dsh-video2text-demo.mp4 --body "演示"
+#    把评论里那行 https://github.com/user-attachments/assets/… 单独放进 README
+#    （单独一行才会渲染成播放器；包在 <p> 里会变成纯文本）
 ```
 
 ## 验证清单
