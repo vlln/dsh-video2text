@@ -10,9 +10,9 @@
   <a href="README.en.md">English</a> · <b>中文</b>
 </p>
 
-<p align="center"><img src="docs/demo.gif" alt="演示" width="820"></p>
+<p align="center"><img src="docs/demo.gif" alt="演示" width="680"></p>
 
-<p align="center"><a href="https://github.com/vlln/dsh-video2text/releases/download/v0.1.0/demo.mp4">▶ 看完整演示（27 秒，877 KB）</a></p>
+<p align="center"><a href="https://github.com/vlln/dsh-video2text/releases/download/v0.1.0/demo.mp4">▶ 看完整演示（17 秒，1.1 MB）</a></p>
 
 抖音、小红书、微信视频号、B站、YouTube 的分享链接，变成发布文案、逐字稿、字幕和章节稿。媒体先落盘，转写没跑完就能先看片子。
 
