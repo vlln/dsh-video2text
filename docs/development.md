@@ -32,7 +32,11 @@ DSH_HOME=/tmp/dsh-v2t-dev dsh web --port 3098 --no-open
 
 ```sh
 rsync -a --delete --exclude .git ../video2text/ skills/video2text/
+# 内置 skill 目录要能直接跑脚本：补一条 scripts 转发（rsync --delete 会删掉它）
+ln -sfn ../../scripts skills/video2text/skills/video2text/scripts
 ```
+
+为什么不能只链到项目根：harness 只认 `<skillsRoot>/<name>/SKILL.md` 这一层（见 `dsh-skill-filesystem` 的 `discoverRoot`），项目根的 SKILL.md 在 `skills/video2text/` 里，需要把链接指向那一层，并让 `$_S/scripts` 仍然可达。
 
 ## 发版
 
