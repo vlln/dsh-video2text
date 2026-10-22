@@ -575,7 +575,7 @@ def asr_transcribe(wav: Path, backend: str, model: str | None, lang: str,
                      "--output-format", "srt", "--output-dir", str(outdir),
                      "--task", "transcribe", "--verbose", "False",
                      "--hallucination-silence-threshold", "2"]
-        if lang:
+        if lang and lang != "auto":
             cmd += ["--language", lang]
         p = run(cmd)
         if p.returncode != 0:
@@ -1033,7 +1033,8 @@ def _asr_chunk_text(chunk: Path, provider: str, base: str, key: str,
 
     boundary = "----v2t" + uuid.uuid4().hex
     parts = []
-    for name, value in (("model", model), ("language", lang or "zh")):
+    for name, value in (("model", model),
+                        ("language", None if lang == "auto" else (lang or "zh"))):
         parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode())
     parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n".encode() + raw + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
@@ -1133,15 +1134,22 @@ def _norm_chars(text: str) -> str:
     return "".join(ch.lower() for ch in text if ch not in PUNCT)
 
 
-def whisper_word_times(wav: Path, work: Path, model: str | None) -> list[tuple[str, float, float]]:
-    """跑一遍本地 whisper 取词级时间，作为强制对齐的锚点。"""
+def whisper_word_times(wav: Path, work: Path, model: str | None,
+                       lang: str | None = None) -> list[tuple[str, float, float]]:
+    """跑一遍本地 whisper 取词级时间，作为强制对齐的锚点。
+
+    `lang` 不传就交给 whisper 自动识别；写死 `zh` 会把英文音频转成中文字，
+    对齐结果因此全错（句长 0.1s 那种）。
+    """
     outdir = work / "align"
     outdir.mkdir(parents=True, exist_ok=True)
     exe = ["mlx_whisper"] if have("mlx_whisper") else ["uvx", "--from", "mlx-whisper", "mlx_whisper"]
     cmd = exe + [str(wav), "--model", model or "mlx-community/whisper-large-v3-turbo",
                  "--output-format", "json", "--output-dir", str(outdir),
                  "--task", "transcribe", "--verbose", "False",
-                 "--word-timestamps", "True", "--language", "zh"]
+                 "--word-timestamps", "True"]
+    if lang and lang != "auto":
+        cmd += ["--language", lang]
     p = run(cmd)
     if p.returncode != 0:
         raise RuntimeError(f"对齐用的本地转写失败：{p.stderr[-300:]}")
@@ -1183,57 +1191,159 @@ def interpolate_sentences(segments: list[dict]) -> list[dict]:
     return out
 
 
+_ABBR = {"mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc",
+         "e.g", "i.e", "u.s", "a.m", "p.m", "no", "fig"}
+
+
 def _sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[。！？!?；;\n])", text)
-    return [p.strip() for p in parts if p.strip()]
+    """中英文混合切句。
+
+    中文按标点直接断；英文的 `.` 只有「后面跟空白且下一句大写开头」才断，
+    并跳过 Mr. / e.g. / 单字母缩写，避免把 `3.5`、`U.S.` 切开。
+    一刻不停的口播可能整段没有标点，超长段按词（中文按字）兜底切。
+    """
+    pieces: list[str] = []
+    buf = ""
+    n = len(text)
+    for i, ch in enumerate(text):
+        buf += ch
+        if ch in "。！？；;…!?\n":
+            pieces.append(buf)
+            buf = ""
+            continue
+        if ch != ".":
+            continue
+        j = i + 1
+        while j < n and text[j] in " \t":
+            j += 1
+        nxt = text[j] if j < n else ""
+        prev = re.search(r"([A-Za-z.]+)$", buf[:-1])
+        word = prev.group(1).lower() if prev else ""
+        is_abbr = word in _ABBR or (len(word) == 1 and word.isalpha())
+        if is_abbr:
+            continue
+        if nxt == "" or nxt.isupper() or nxt in "\"'([":
+            pieces.append(buf)
+            buf = ""
+    if buf.strip():
+        pieces.append(buf)
+    out: list[str] = []
+    for piece in pieces:
+        out.extend(_split_long(piece.strip()))
+    return out
+
+
+def _split_long(text: str, limit: int | None = None) -> list[str]:
+    """没有标点的长段落切到可读长度：英文按词，中文按字。"""
+    if not text:
+        return []
+    if limit is None:
+        limit = 320 if " " in text else 200
+    if len(text) <= limit:
+        return [text]
+    if " " in text:
+        out: list[str] = []
+        buf = ""
+        for word in text.split():
+            if buf and len(buf) + 1 + len(word) > limit:
+                out.append(buf)
+                buf = word
+            else:
+                buf = f"{buf} {word}".strip()
+        if buf:
+            out.append(buf)
+        return out
+    return [text[i:i + limit] for i in range(0, len(text), limit)]
 
 
 def align_segments(chunk_segments: list[dict], wav: Path, work: Path,
-                   model: str | None) -> list[dict]:
+                   model: str | None, lang: str | None = None) -> list[dict]:
     """把云端文本切句，再用本地词级时间做单调对齐；失败句回退到线性插值。"""
-    words = whisper_word_times(wav, work, model)
+    latin = len(re.findall(r"[A-Za-z]", " ".join(str(x.get("text") or "") for x in chunk_segments))) > 40
+    words = whisper_word_times(wav, work, model, "en" if latin else (lang or "zh"))
     if not words:
         raise RuntimeError("没有可用于对齐的词级时间")
-    # whisper 字符序列 + 每个字符的时间
-    wchars, wtimes = [], []
-    for text, start, end in words:
-        n = len(text)
-        for i, ch in enumerate(text):
-            wchars.append(ch)
-            wtimes.append((start, end))
-    sent_texts = []
-    for seg in chunk_segments:
-        sent_texts.extend(_sentences(seg["text"]))
-    if not sent_texts:
-        return chunk_segments
-    cloud = "".join(_norm_chars(t) for t in sent_texts)
+    if latin:
+        # 英文按「词」对齐：whisper 的词级时间本身就是词，逐字符匹配容易错位
+        def toks(text: str) -> list[str]:
+            return re.findall(r"[a-z0-9']+", text.lower())
 
-    from difflib import SequenceMatcher
-    matcher = SequenceMatcher(None, "".join(wchars), cloud, autojunk=False)
-    # cloud 下标 -> whisper 下标
-    cloud_to_w = {}
-    for a, b, size in matcher.get_matching_blocks():
-        for k in range(size):
-            cloud_to_w[b + k] = a + k
+        wtoks, wtimes = [], []
+        for text, start, end in words:
+            for tok in toks(text):
+                wtoks.append(tok)
+                wtimes.append((start, end))
 
-    result = []
-    offset = 0
-    for text in sent_texts:
-        norm = _norm_chars(text)
-        if not norm:
-            offset += len(norm)
-            continue
-        idxs = [cloud_to_w.get(offset + k) for k in range(len(norm))]
-        hits = [i for i in idxs if i is not None]
-        coverage = len(hits) / len(norm)
-        if coverage >= 0.3:
-            start = wtimes[min(hits)][0]
-            end = wtimes[max(hits)][1]
-        else:
+        sent_texts = []
+        for seg in chunk_segments:
+            sent_texts.extend(_sentences(seg["text"]))
+        if not sent_texts:
+            return chunk_segments
+        sent_tokens = [toks(t) for t in sent_texts]
+        cloud_tokens = [tok for group in sent_tokens for tok in group]
+
+        from difflib import SequenceMatcher
+        matcher = SequenceMatcher(None, wtoks, cloud_tokens, autojunk=False)
+        cloud_to_w = {}
+        for a, b, size in matcher.get_matching_blocks():
+            for k in range(size):
+                cloud_to_w[b + k] = a + k
+
+        result = []
+        offset = 0
+        for text, group in zip(sent_texts, sent_tokens):
+            idxs = [cloud_to_w.get(offset + k) for k in range(len(group))]
+            hits = [i for i in idxs if i is not None]
+            coverage = len(hits) / max(1, len(group))
             start = end = None
-        result.append({"text": text, "start": start, "end": end,
-                       "coverage": round(coverage, 2)})
-        offset += len(norm)
+            if len(group) >= 2 and coverage >= 0.5:
+                start = wtimes[min(hits)][0]
+                end = wtimes[max(hits)][1]
+            result.append({"text": text, "start": start, "end": end,
+                           "coverage": round(coverage, 2)})
+            offset += len(group)
+    else:
+        # 中文按字符匹配
+        wchars, wtimes = [], []
+        for text, start, end in words:
+            for ch in text:
+                wchars.append(ch)
+                wtimes.append((start, end))
+        sent_texts = []
+        for seg in chunk_segments:
+            sent_texts.extend(_sentences(seg["text"]))
+        if not sent_texts:
+            return chunk_segments
+        cloud = "".join(_norm_chars(t) for t in sent_texts)
+
+        from difflib import SequenceMatcher
+        matcher = SequenceMatcher(None, "".join(wchars), cloud, autojunk=False)
+        cloud_to_w = {}
+        for a, b, size in matcher.get_matching_blocks():
+            for k in range(size):
+                cloud_to_w[b + k] = a + k
+
+        result = []
+        offset = 0
+        for text in sent_texts:
+            norm = _norm_chars(text)
+            if not norm:
+                continue
+            idxs = [cloud_to_w.get(offset + k) for k in range(len(norm))]
+            hits = [i for i in idxs if i is not None]
+            coverage = len(hits) / len(norm)
+            start = end = None
+            if coverage >= 0.3:
+                start = wtimes[min(hits)][0]
+                end = wtimes[max(hits)][1]
+            result.append({"text": text, "start": start, "end": end,
+                           "coverage": round(coverage, 2)})
+            offset += len(norm)
+
+    # 反直觉的时长（一句话 0.1 秒）说明匹配错位，交给插值
+    for seg in result:
+        if seg["start"] is not None and (seg["end"] - seg["start"]) < 0.6 and len(seg["text"]) > 12:
+            seg["start"] = seg["end"] = None
 
     # 未对齐的句子按前后已对齐句线性插值
     duration = audio_duration(wav)
@@ -1500,7 +1610,10 @@ def realign_dir(target: str, model: str | None = None) -> Path:
     wav = work / "audio16k.wav"
     ffmpeg_to_wav(media, wav, None)
     log(f"[align] 词级时间（{len(segments)} 句）…")
-    aligned = align_segments(segments, wav, work, model or cfg("ALIGN_MODEL") or cfg("MODEL") or None)
+    sample = " ".join(str(x.get("text") or "") for x in segments[:40])
+    guess = "en" if len(re.findall(r"[A-Za-z]", sample)) > 40 else "zh"
+    aligned = align_segments(segments, wav, work,
+                             model or cfg("ALIGN_MODEL") or cfg("MODEL") or None, guess)
     side["segments"] = aligned
     side["aligned"] = True
     sidecar_path.write_text(json.dumps(side, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -1900,7 +2013,8 @@ def main() -> int:
     ap.add_argument("url", nargs="?", help="视频链接（或配合 --from-file）")
     ap.add_argument("--from-file", help="本地音视频/录屏文件，跳过下载")
     ap.add_argument("--out", default=".", help="输出目录 (default: .)")
-    ap.add_argument("--lang", default="zh", help="ASR 语言 (default: zh)")
+    ap.add_argument("--lang", default="zh",
+                    help="ASR 语言 (default: zh；auto = 让模型自动识别，英文视频建议 en 或 auto)")
     ap.add_argument("--model", help="ASR 模型")
     ap.add_argument("--backend", default="auto", choices=["auto", "mlx", "whispercpp", "api"])
     ap.add_argument("--cookies-from-browser", help="如 chrome / safari，用于抖音/小红书")
@@ -2138,12 +2252,18 @@ def main() -> int:
                 segments = asr_transcribe(wav, backend, args.model, args.lang, work, fixes)
             want_align = False if args.no_align else (args.align or cfg_bool("align", False))
             if backend == "api" and segments and not want_align:
+                before = len(segments)
                 segments = interpolate_sentences(segments)
                 log("[3/3] 按标点切句（时间在分片内插值，未做词级对齐）")
+                if segments:
+                    avg = (audio_duration(wav) or 0) / max(1, len(segments))
+                    if avg > 45:
+                        log(f"[warn] 平均每句 {avg:.0f}s（{before} 个分片 → {len(segments)} 句）："
+                            "切句可能失败，建议 --align 做词级对齐")
             if want_align and backend == "api" and segments:
                 log("[3/3] 句级对齐（本地词级时间）…")
                 try:
-                    segments = apply_fixes(align_segments(segments, wav, work, args.model), fixes)
+                    segments = apply_fixes(align_segments(segments, wav, work, args.model, args.lang), fixes)
                 except Exception as e:
                     log(f"align fallback: {e}")
             meta["asr"] = backend
