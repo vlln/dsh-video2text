@@ -490,6 +490,7 @@ def yt_extractor_args() -> list[str]:
 
 
 def yt_meta(url: str, cookies: str | None, cookies_file: str | None = None) -> dict:
+    """yt-dlp 取元数据。失败时由调用方决定是否走平台 API 兜底。"""
     cmd = ytdlp_cmd() + ["-J", "--no-warnings", "--socket-timeout", "20"] + yt_plugin_dirs() + yt_extractor_args()
     cmd += yt_plugin_dirs() + yt_extractor_args()
     if cookies:
@@ -1749,6 +1750,101 @@ def run_batch(args) -> int:
     return 0 if fail == 0 else 3
 
 
+# ---------------------------------------------------------------- B站 API 兜底
+# yt-dlp 在某些 B 站稿件上会报 "Unable to extract initial state"（页面结构变化 /
+# 风控）。这时直接走 web API：view 取元数据，player/playurl 取 DASH 流。
+
+BILI_UA = UA_DESKTOP
+BILI_HEADERS = {"User-Agent": BILI_UA, "Referer": "https://www.bilibili.com/"}
+
+
+def bili_bvid(ident: str) -> str:
+    """从链接里取 BV 号；b23.tv 短链先跟一次跳转。"""
+    m = re.search(r"(BV[0-9A-Za-z]{10}|av\d+)", ident)
+    if m:
+        return m.group(1)
+    if "b23.tv" in ident:
+        final = run(["curl", "-sSL", "--max-time", "20", "-o", "/dev/null",
+                     "-w", "%{url_effective}", ident]).stdout
+        m = re.search(r"(BV[0-9A-Za-z]{10}|av\d+)", final)
+        if m:
+            return m.group(1)
+    raise RuntimeError("B站链接里没有 BV 号")
+
+
+def bili_curl(url: str, timeout: int = 30) -> bytes:
+    """B站对 Python 的 TLS 指纹返回 412，统一用 curl 取。"""
+    cmd = ["curl", "-sSL", "--max-time", str(timeout), "-A", BILI_UA,
+           "-H", "Referer: https://www.bilibili.com/", "-H", "Accept: */*", url]
+    p = subprocess.run(cmd, capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"curl 失败（{p.returncode}）：{(p.stderr or b'').decode()[:120]}")
+    return p.stdout
+
+
+def bili_api(path: str, params: dict) -> dict:
+    q = urllib.parse.urlencode(params)
+    raw = bili_curl(f"https://api.bilibili.com/{path}?{q}")
+    data = json.loads(raw.decode("utf-8", "replace"))
+    if data.get("code") != 0:
+        raise RuntimeError(f"B站接口 {path} 返回 {data.get('code')} {data.get('message')}")
+    return data.get("data") or {}
+
+
+def bili_meta(ident: str) -> dict:
+    bvid = bili_bvid(ident)
+    view = bili_api("x/web-interface/view", {"bvid": bvid})
+    pages = view.get("pages") or [{}]
+    return {
+        "platform": "B站",
+        "bvid": bvid,
+        "url": f"https://www.bilibili.com/video/{bvid}",
+        "cid": pages[0].get("cid") or view.get("cid"),
+        "title": view.get("title", ""),
+        "description": view.get("desc", ""),
+        "author": (view.get("owner") or {}).get("name", ""),
+        "published": time.strftime("%Y-%m-%d", time.localtime(view["pubdate"])) if view.get("pubdate") else "",
+        "duration": float(view.get("duration") or 0),
+        "thumbnail": view.get("pic", ""),
+    }
+
+
+def bili_streams(bvid: str, cid: int | str) -> dict:
+    data = bili_api("x/player/playurl",
+                    {"bvid": bvid, "cid": cid, "fnval": 16, "qn": 64, "fourk": 1})
+    dash = data.get("dash") or {}
+    if not dash:
+        raise RuntimeError("B站未返回 DASH 流（可能需要登录或为充电视频）")
+    videos = [v for v in (dash.get("video") or []) if v.get("baseUrl")]
+    audios = [a for a in (dash.get("audio") or []) if a.get("baseUrl")]
+    if not videos or not audios:
+        raise RuntimeError("B站 DASH 流为空")
+    # 优先 avc，ffmpeg 兼容性最好
+    videos.sort(key=lambda v: (v.get("codecid") != 7, -(v.get("bandwidth") or 0)))
+    audios.sort(key=lambda a: -(a.get("bandwidth") or 0))
+    return {"video": videos[0]["baseUrl"], "audio": audios[0]["baseUrl"]}
+
+
+def bili_download(ident: str, outdir: Path, want_video: bool,
+                  max_seconds: int | None = None) -> tuple[Path, Path]:
+    meta = bili_meta(ident)
+    streams = bili_streams(meta["bvid"], meta["cid"])
+    outdir.mkdir(parents=True, exist_ok=True)
+    audio = outdir / "media.m4a"
+    audio.write_bytes(bili_curl(streams["audio"], 300))
+    if want_video:
+        video = outdir / "bili.m4v"
+        video.write_bytes(bili_curl(streams["video"], 300))
+        src = outdir / "source.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(video), "-i", str(audio),
+                        "-c", "copy", str(src)], check=True)
+    else:
+        src = audio
+    wav = outdir / "audio16k.wav"
+    ffmpeg_to_wav(src, wav, max_seconds)
+    return wav, src
+
+
 def probe(url: str, cookies_from_browser: str | None = None,
           cookies_file: str | None = None) -> dict:
     platform, ident = detect(url)
@@ -1781,6 +1877,15 @@ def probe(url: str, cookies_from_browser: str | None = None,
         out.update({"title": meta.get("title", ""), "author": meta.get("author", ""),
                     "published": meta.get("published", ""), "cover": meta.get("cover", ""),
                     "platform": "微信视频号"})
+    elif platform == "bilibili":
+        try:
+            meta = yt_meta(ident, cookies_from_browser or "", cookies_file or "")
+        except Exception:
+            meta = bili_meta(ident)
+        out.update({"title": meta.get("title", ""), "author": meta.get("author", ""),
+                    "published": meta.get("published", ""),
+                    "duration": float(meta.get("duration") or 0),
+                    "cover": meta.get("thumbnail", ""), "platform": meta.get("platform", "")})
     else:
         meta = yt_meta(ident, cookies_from_browser or "", cookies_file or "")
         out.update({"title": meta.get("title", ""), "author": meta.get("author", ""),
@@ -1975,11 +2080,23 @@ def main() -> int:
                         "当前只拿到发布文案。登录后重跑即可全自动。")
         else:
             log("[1/3] yt-dlp：取元数据…")
-            meta = yt_meta(ident, args.cookies_from_browser, args.cookies_file)
+            try:
+                meta = yt_meta(ident, args.cookies_from_browser, args.cookies_file)
+            except Exception as e:
+                if platform != "bilibili":
+                    raise
+                log(f"yt-dlp 取元数据失败，改用 B站 API：{str(e)[:80]}")
+                meta = bili_meta(ident)
             log("[2/3] 下载音轨…")
-            wav, src_media = yt_download_audio(ident, work, args.cookies_from_browser,
-                                               args.max_seconds, args.cookies_file,
-                                               video=bool(args.media_dir))
+            try:
+                wav, src_media = yt_download_audio(ident, work, args.cookies_from_browser,
+                                                   args.max_seconds, args.cookies_file,
+                                                   video=bool(args.media_dir))
+            except Exception as e:
+                if platform != "bilibili":
+                    raise
+                log(f"yt-dlp 下载失败，改用 B站 API：{str(e)[:80]}")
+                wav, src_media = bili_download(ident, work, bool(args.media_dir), args.max_seconds)
             media_src = src_media
     except Exception as e:
         log(f"error: {e}")

@@ -71,6 +71,8 @@ gh issue comment <issue> --attach ~/Movies/dsh-video2text-demo.mp4 --body "演�
 
 ## 已知的坑
 
+- **B 站两条独立的坑**：① yt-dlp 的 B 站提取器会在部分稿件上报 `Unable to extract initial state`（页面结构变了）；② `api.bilibili.com` 对 Python 的 TLS 指纹直接回 **412**，curl 却正常。所以引擎里 B 站走「yt-dlp 失败 → API 兜底」，API 与媒体下载统一用 `curl` 子进程。
+
 - **client 崩溃会白屏**：任何 `ReferenceError` 都会让整个槽位消失。现在有 `PanelBoundary` 兜底，但仍然要在真实浏览器里点一遍各状态（done / running / auth / failed）。
 - **窗口级 pointerdown 会抢先关菜单**：菜单项必须带 `data-v2t-menu`，监听器跳过它，否则 `click` 到不了按钮。
 - **轮询要覆盖后处理**：对齐中的任务是 `done` 状态，只按 `running` 轮询会导致界面不刷新。
