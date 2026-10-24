@@ -64,7 +64,16 @@ Keys stay in the local config file and are hidden in the UI by default. Cloud tr
 
 ## Skills
 
-The plugin bundles `skills/video2text` and symlinks it into `$DSH_HOME/skills/video2text`, so the agent discovers it through the normal skill path — no extra tool is registered. The skill also works standalone: `python3 scripts/video2text <url> --out ./out`.
+The plugin bundles `skills/video2text` (SKILL.md + scripts + docs + examples) and symlinks it into `$DSH_HOME/skills/video2text`, so the agent discovers it through the normal skill path — no extra tool is registered.
+
+Want the skill without the plugin? Take it straight from this repo:
+
+```sh
+git clone --depth 1 https://github.com/vlln/dsh-video2text
+cd dsh-video2text/skills/video2text
+cp -R skills/video2text ~/.agents/skills/video2text   # or your own skills dir
+python3 scripts/video2text "https://www.bilibili.com/video/BV…" --out ./out
+```
 
 ## Compatibility
 

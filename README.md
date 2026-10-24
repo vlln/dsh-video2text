@@ -181,7 +181,16 @@ YouTube 对无登录态请求返回 `Sign in to confirm you're not a bot`。社�
 
 ## 与 skill 的关系
 
-插件自带 `skills/video2text`，首次加载软链到 `$DSH_HOME/skills/video2text`，agent 通过常规发现路径读到它 —— 不给 agent 新增工具。skill 也能脱离 dsh 单独用：`python3 scripts/video2text <url> --out ./out`。
+插件自带 `skills/video2text`（完整可跑：SKILL.md + scripts + docs + examples），首次加载软链到 `$DSH_HOME/skills/video2text`，agent 通过常规发现路径读到它 —— 不给 agent 新增工具。
+
+不想装插件、只想用 skill？直接取仓库里这一份即可：
+
+```sh
+git clone --depth 1 https://github.com/vlln/dsh-video2text
+cd dsh-video2text/skills/video2text
+cp -R skills/video2text ~/.agents/skills/video2text   # 或你自己惯用的 skills 目录
+python3 scripts/video2text "https://www.bilibili.com/video/BV…" --out ./out
+```
 
 ## 更新记录
 
