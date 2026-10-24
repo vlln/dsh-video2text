@@ -1958,6 +1958,107 @@ def bili_download(ident: str, outdir: Path, want_video: bool,
     return wav, src
 
 
+
+# ---------------------------------------------------------------- 画面速览（contact sheet）
+# 把某个区间的画面按固定间隔抽帧、拼成一张 JPG：不看视频也能判断动态与节奏。
+# 采样用「总帧数」而不是 fps —— 11 分钟的视频 1fps 就是 660 张，读不了。
+
+def media_duration(path: Path) -> float:
+    p = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)])
+    try:
+        return float((p.stdout or "0").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def sheet_frame_count(span: float, count: int) -> int:
+    return max(1, min(int(count), int(span) or 1))
+
+
+def auto_sheet_count(span: float, target: int = 48) -> tuple[int, float]:
+    """按区间长度自动定帧数与间隔：始终一张图，帧数收敛在 ~48。
+
+    短片段更密（0.5s 一帧看动态），长片段自动拉稀（半小时也能一张读完）。
+    """
+    step = max(0.5, min(30.0, span / max(1, target)))
+    count = int(round(span / step))
+    return max(2, min(96, count)), step
+
+
+def render_sheet(media: Path, out: Path, start: float = 0.0, end: float | None = None,
+                 count: int | None = None, cols: int = 8, width: int = 320,
+                 title: str = "", quality: int = 88) -> Path:
+    """区间等间隔抽 N 帧 → 拼版 → 写时间戳与页眉，输出一张 JPG。
+
+    逐帧抽（而不是一刀 `fps` 滤镜）是为了**正好 N 帧**：fps 滤镜会按帧率四舍五入，
+    出现空格子或黑块。逐帧 seek 对长视频也很快。
+    """
+    total = media_duration(media)
+    end = total if end is None else min(end, total)
+    start = max(0.0, min(start, max(0.0, end - 0.2)))
+    span = max(0.2, end - start)
+    if count is None:
+        count, _ = auto_sheet_count(span)
+    count = max(1, min(int(count), 96))
+    cols = max(1, min(int(cols), count))
+    rows = (count + cols - 1) // cols
+
+    from PIL import Image, ImageDraw, ImageFont
+    import tempfile
+
+    font = _sheet_font(ImageFont, size=max(11, width // 22))
+    small = _sheet_font(ImageFont, size=max(10, width // 26))
+    frames: list[Image.Image] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i in range(count):
+            t = start + span * (i + 0.5) / count
+            dst = Path(tmpdir) / f"f{i:03d}.jpg"
+            p = run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.3f}", "-i", str(media),
+                     "-frames:v", "1", "-vf", f"scale={width}:-2:flags=lanczos",
+                     "-q:v", "3", str(dst)])
+            if p.returncode != 0 or not dst.exists():
+                continue
+            img = Image.open(dst).convert("RGB")
+            d = ImageDraw.Draw(img, "RGBA")
+            label = f"{int(t // 60)}:{t % 60:04.1f}"
+            tw = d.textlength(label, font=small)
+            d.rectangle([6, img.height - small.size - 13, 6 + tw + 10, img.height - 6],
+                        fill=(0, 0, 0, 150))
+            d.text((11, img.height - small.size - 12), label, font=small, fill=(255, 255, 255, 235))
+            frames.append(img)
+
+    if not frames:
+        raise RuntimeError("没有抽到任何帧")
+    tile_w = max(f.width for f in frames)
+    tile_h = max(f.height for f in frames)
+    rows = (len(frames) + cols - 1) // cols
+    header = 34
+    canvas = Image.new("RGB", (tile_w * cols, tile_h * rows + header), (18, 18, 20))
+    for i, img in enumerate(frames):
+        r, c = divmod(i, cols)
+        canvas.paste(img, (c * tile_w, header + r * tile_h))
+    d2 = ImageDraw.Draw(canvas)
+    info = (f"{title[:70]}   ·   {start:.0f}–{end:.0f}s / {total:.0f}s"
+            f"   ·   {len(frames)} 帧 · {cols}×{rows}   ·   {span / max(1, len(frames)):.2f}s 一帧")
+    d2.text((12, 9), info, font=font, fill=(235, 235, 238))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out, "JPEG", quality=quality, optimize=True)
+    return out
+
+
+def _sheet_font(ImageFont, size: int):
+    for name in ("PingFang.ttc", "Hiragino Sans GB.ttc", "Helvetica.ttc"):
+        try:
+            return ImageFont.truetype(f"/System/Library/Fonts/{name}", size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
+
+
 def probe(url: str, cookies_from_browser: str | None = None,
           cookies_file: str | None = None) -> dict:
     platform, ident = detect(url)
@@ -2038,6 +2139,14 @@ def main() -> int:
     ap.add_argument("--config-merge", action="store_true", help="从 stdin 读 JSON 合并进固定配置")
     ap.add_argument("--realign", help="对已转写的目录补做句级对齐（不重新转写）")
     ap.add_argument("--export", help="从已转写目录（或 *.json）再导出发布稿，配合 --format")
+    ap.add_argument("--sheet", metavar="OUT.jpg", help="导出「画面速览」：区间抽帧拼成一张 JPG")
+    ap.add_argument("--sheet-start", type=float, default=0.0, help="速览起始秒（默认 0）")
+    ap.add_argument("--sheet-end", type=float, help="速览结束秒（默认整条）")
+    ap.add_argument("--sheet-count", type=int, default=None,
+                    help="总帧数（默认按区间长度自动：约 48，0.5–30s 一帧）")
+    ap.add_argument("--sheet-cols", type=int, default=8, help="每行帧数（默认 8）")
+    ap.add_argument("--sheet-width", type=int, default=320, help="每帧宽度像素（默认 320）")
+    ap.add_argument("--sheet-title", help="速览页眉标题（默认用文件名）")
     ap.add_argument("--format", default="publish", choices=EXPORT_FORMATS,
                     help="导出格式：publish 发布稿 / script 纯口播 / chapters 章节 / srt 字幕 / bundle 打包")
     ap.add_argument("--probe", action="store_true", help="只取元数据（封面/标题/时长），不下载不转写")
@@ -2098,6 +2207,25 @@ def main() -> int:
             return 0
         except Exception as e:
             log(f"export error: {e}")
+            return 2
+
+    if args.sheet:
+        media = Path(args.from_file or args.sheet_media or "").expanduser() if (args.from_file or getattr(args, "sheet_media", None)) else None
+        if media is None:
+            log("sheet error: 需要 --from-file <媒体> 或 --sheet-media")
+            return 2
+        if not media.exists():
+            log(f"sheet error: 找不到媒体 {media}")
+            return 2
+        try:
+            out = Path(args.sheet).expanduser()
+            render_sheet(media, out, args.sheet_start, args.sheet_end,
+                         args.sheet_count, args.sheet_cols, args.sheet_width,
+                         title=args.sheet_title or media.stem)
+            print(out)
+            return 0
+        except Exception as e:
+            log(f"sheet error: {e}")
             return 2
 
     if args.probe:
