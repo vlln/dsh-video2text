@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/b2129376-e838-494e-9b89-7041f4acf57c
 | 转写 | 云端 Qwen3-Omni（中文标点与专名更准）或本地 mlx-whisper / whisper.cpp |
 | 播放器 | 自绘控件、逐句同步高亮、字幕、倍速、画中画、全屏 |
 | 时间轴 | 默认按标点切句 + 分片内插值；需要时一键做词级对齐 |
-| 导出 | 发布稿（自动章节）/ 字幕 SRT / 全部打包 ZIP |
+| 导出 | 发布稿（自动章节）/ 字幕 SRT / **画面速览 JPG**（区间抽帧拼版）/ ZIP |
 | 账号 | 抖音、小红书扫码；视频号扫码 + 会话验证，缺登录时直接引导 |
 | 任务 | 搜索、按天分组、重试复用原卡、删除、从其它目录导入 |
 | 交给 agent | 「问 AI」新建会话、切到任务工作区、预填上下文 |
@@ -90,6 +90,8 @@ dsh plugin --profile web add "github:vlln/dsh-video2text"
 | 字幕 SRT | 逐句字幕 |
 | 画面速览（JPG） | 选中区间抽帧拼成一张图：角标带时间，页眉写区间/帧数/间隔 |
 | 全部（ZIP） | 上面两份 + sidecar JSON |
+
+![画面速览](docs/preview-sheet.png)
 
 **画面速览**：在播放器进度条上**拖动**框选区间（单击仍是跳转），任务下方会出现「已选区间 1:07 – 2:29 · 81s」，并带一张 4×3 的预览缩略图：
 
@@ -180,6 +182,10 @@ YouTube 对无登录态请求返回 `Sign in to confirm you're not a bot`。社�
 ## 与 skill 的关系
 
 插件自带 `skills/video2text`，首次加载软链到 `$DSH_HOME/skills/video2text`，agent 通过常规发现路径读到它 —— 不给 agent 新增工具。skill 也能脱离 dsh 单独用：`python3 scripts/video2text <url> --out ./out`。
+
+## 更新记录
+
+见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 参与开发
 
