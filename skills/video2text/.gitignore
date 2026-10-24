@@ -4,3 +4,6 @@ out/
 *.mp4
 __pycache__/
 .DS_Store
+align/
+.video2text/
+*.bak
