@@ -29,7 +29,8 @@ This plugin moves the whole loop into the dsh sidebar: paste, press Enter, and p
 ## Install
 
 ```sh
-dsh plugin --profile web add "github:vlln/dsh-video2text"
+dsh plugin --profile web add dsh-video2text
+# to track the latest commit instead: dsh plugin --profile web add "github:vlln/dsh-video2text"
 ```
 
 Restart `dsh web` afterwards (the Node half registers at boot). A "Video to Text" entry then appears in the sidebar.

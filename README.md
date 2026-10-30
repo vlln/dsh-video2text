@@ -35,12 +35,13 @@ https://github.com/user-attachments/assets/b2129376-e838-494e-9b89-7041f4acf57c
 
 ## 安装
 
-**从 GUI**：侧栏 **Plugins** → 添加插件 → 填 `github:vlln/dsh-video2text`。
+**从 GUI**：侧栏 **Plugins** → 添加插件 → 填 `dsh-video2text`。
 
 **从命令行**：
 
 ```sh
-dsh plugin --profile web add "github:vlln/dsh-video2text"
+dsh plugin --profile web add dsh-video2text
+# 想跟最新提交而不是发布版：dsh plugin --profile web add "github:vlln/dsh-video2text"
 ```
 
 两条路径都在干净环境里验证过（dsh `0.2.1-rc.1`）。装完**重启 `dsh web`** —— Node half 在启动时注册，刷新页面不会出现面板。确认方法：侧栏出现「视频转文案」，贴一条 B 站链接回车，几秒内出现任务卡与封面；转写完成后「导出 → 发布稿」应下载一个 `.publish.md`。
