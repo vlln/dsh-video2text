@@ -37,6 +37,26 @@ Restart `dsh web` afterwards (the Node half registers at boot). A "Video to Text
 
 Requirements: macOS, Python 3.9+, `ffmpeg`, `node`; `playwright` + Chrome for WeChat Channels; `mlx-whisper` (Apple Silicon) or `whisper.cpp` for local transcription.
 
+### Skill only, without the plugin
+
+`skills/video2text/` in this repo is the complete video2text skill (engine scripts + `SKILL.md`), usable on its own:
+
+```sh
+git clone --depth 1 --filter=blob:none --sparse https://github.com/vlln/dsh-video2text
+cd dsh-video2text
+git sparse-checkout set skills/video2text      # fetch just that subfolder
+```
+
+To install it into another agent (e.g. `~/.claude/skills/video2text`), `SKILL.md` and `scripts/` must sit side by side — the `scripts` entry under `skills/video2text/skills/video2text/` is a relative symlink and breaks when copied alone:
+
+```sh
+mkdir -p ~/.claude/skills/video2text
+cp skills/video2text/skills/video2text/SKILL.md ~/.claude/skills/video2text/
+cp -R skills/video2text/scripts ~/.claude/skills/video2text/
+```
+
+Self-check after installing: `python3 ~/.claude/skills/video2text/scripts/video2text --status` (for Douyin, run `--setup-douyin` first).
+
 ## What you get
 
 | Capability | Notes |

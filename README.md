@@ -53,6 +53,26 @@ dsh plugin --profile web add dsh-video2text
 - 视频号需要 `playwright` 与本机 Chrome：`pip install playwright`
 - 本地转写需要 `mlx-whisper`（Apple Silicon）或 `whisper.cpp`；只用云端转写可以不装
 
+### 不装插件，只要 skill
+
+插件的 `skills/video2text/` 就是完整的 video2text skill（引擎脚本 + `SKILL.md`），可以不装插件直接取用：
+
+```sh
+git clone --depth 1 --filter=blob:none --sparse https://github.com/vlln/dsh-video2text
+cd dsh-video2text
+git sparse-checkout set skills/video2text      # 只拉这一个子目录
+```
+
+装给别的 agent（例如 `~/.claude/skills/video2text`）时，要让 `SKILL.md` 和 `scripts/` 同级：`skills/video2text/skills/video2text/scripts` 是指向引擎目录的相对软链，整个拷出去会断，所以分开拷——
+
+```sh
+mkdir -p ~/.claude/skills/video2text
+cp skills/video2text/skills/video2text/SKILL.md ~/.claude/skills/video2text/
+cp -R skills/video2text/scripts ~/.claude/skills/video2text/
+```
+
+装好先自检：`python3 ~/.claude/skills/video2text/scripts/video2text --status`（抖音还要先 `--setup-douyin` 装解析组件）。
+
 ## 用起来
 
 ### 入列即转写
