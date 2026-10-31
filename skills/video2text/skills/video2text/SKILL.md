@@ -4,7 +4,7 @@ description: Use this skill when the user wants the 文案/口播稿/逐字稿/�
 license: MIT
 metadata:
   author: vlln
-  version: "0.2.0"
+  version: "0.2.1"
 ---
 
 # video2text
@@ -31,6 +31,7 @@ brew install ffmpeg node           # 必需（node 仅视频号解密用）
 uv tool install mlx-whisper        # Apple Silicon 推荐
 brew install yt-dlp                # 可选：缺失时自动退到 `uvx yt-dlp`
 # 或：brew install whisper-cpp     # 跨平台，需自备 ggml 模型
+brew install uv git                # 仅抖音需要（--setup-douyin 用）
 ```
 
 Python 3.9+，仅标准库。
@@ -47,6 +48,7 @@ python3 $_S/scripts/video2text --from-file ~/Desktop/wechat.mov --out ./out
 # 常用开关
 --wechat-session                # 视频号：弹窗扫码 → 登录态内解析 → 自动跑完
 --login douyin|xhs              # 扫码登录并写入固定配置（推荐）
+--setup-douyin                  # 安装/修复抖音解析组件 DouK（幂等，坏了一次修好）
 --cookies-from-browser chrome   # 备用：直接读浏览器 Cookie
 --max-seconds 60                # 只跑前 60 秒，先看质量
 --model mlx-community/whisper-large-v3-turbo   # 下载慢可用 -q4 量化版
@@ -110,7 +112,7 @@ python3 $_S/scripts/video2text --export ./out --format publish
 
 登录态失效的判定：脚本超时退出、日志停在「打开浏览器扫码」。这时**不要**反复重开窗口，先问用户是否完成了手机确认。
 
-### B站 / YouTube / 抖音 / 小红书
+### B站 / YouTube / 小红书
 
 直接跑，不需要弹窗：
 
@@ -118,13 +120,29 @@ python3 $_S/scripts/video2text --export ./out --format publish
 python3 $_S/scripts/video2text "<链接>" --out ./out
 ```
 
-抖音/小红书报 `403` / `login required` / `Fresh cookies` 时，按顺序试：
+小红书报 `403` / `Fresh cookies` 时，按顺序试：
 
 1. `--cookies-from-browser chrome`（读用户 Chrome 登录态）
 2. `--cookies-file cookies.txt`（用户从浏览器导出的 Netscape 格式）
-3. 仍失败 → 换手机分享短链，或改用 [Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API) 自建解析服务
+3. 仍失败 → 先起本地 XHS-Downloader 服务（见下）
 
-**抖音的坑**：`Fresh cookies (not necessarily logged in) are needed` 这个报错有误导性。真实原因是 `/aweme/v1/web/aweme/detail/` 需要 `a_bogus` 签名参数，detail 返回空后 extractor 会归因到 cookie。只补 cookie 通常无效——yt-dlp 目前没有实现该签名（源码里是 TODO）。无头浏览器直接抓页面也常被风控拦成空壳页。
+### 抖音（`v.douyin.com` / `douyin.com`）
+
+抖音解析要 DouK-Downloader 做 `a_bogus` 签名，它装在家目录（**不要装 `/tmp`**，会被系统清掉）。三条命令：
+
+```bash
+python3 $_S/scripts/video2text --setup-douyin            # 一次性：克隆 + 装依赖到 ~/.local/share/video2text/DouK
+python3 $_S/scripts/video2text --login douyin            # 一次性：扫码，Cookie 写进固定配置
+python3 $_S/scripts/video2text "https://v.douyin.com/xxx" --out ./out
+```
+
+- `--setup-douyin` 是**幂等**的：目录缺了会克隆，检出坏了（缺 `src/`）会 `fetch + reset --hard + clean` 修好，然后写回配置 `douk_path`。
+- 抖音短链不用手工展开：脚本自己跟 302 拿 `aweme_id`。
+- 报 `[service:douyin]` 就是 DouK 没装好 → 跑 `--setup-douyin`；报 `[auth:douyin]` 是登录态过期或风控 → 跑 `--login douyin` 重扫。
+
+**抖音的坑**：`Fresh cookies (not necessarily logged in) are needed` 这个报错有误导性。真实原因是 `/aweme/v1/web/aweme/detail/` 需要 `a_bogus` 签名参数，detail 返回空后 extractor 会归因到 cookie。只补 cookie 通常无效——yt-dlp 目前没有实现该签名（源码里是 TODO）。无头浏览器直接抓页面也常被风控拦成空壳页，`iesdouyin.com/share/...` 的 SSR 数据里已经没有 `videoInfoRes` 了。
+
+> 历史坑（2026-10-31）：DouK 曾装在 `/tmp/DouK`，被系统清理后只剩一个 `.venv`，`--status` 只看目录存在就报正常，真实调用抛 `ModuleNotFoundError: No module named 'src'`。现在 `--status` 的 `douk_path.ready` 才是判据。
 
 ## 平台现实
 
@@ -134,7 +152,7 @@ python3 $_S/scripts/video2text "<链接>" --out ./out
 |---|---|---|---|
 | B站 | ✅ | ✅ yt-dlp | CC 字幕覆盖率低，基本都走 ASR |
 | YouTube | ✅ | ✅ yt-dlp | 可直接 `--write-auto-subs`，更省事 |
-| 抖音 | ✅ | ⚠️ 需本地服务 | yt-dlp 缺 a_bogus 签名；用 DouK-Downloader API |
+| 抖音 | ✅ | ✅ DouK | yt-dlp 缺 a_bogus 签名；DouK 本地解析，`--setup-douyin` 一次性装 |
 | 小红书 | ✅ | ⚠️ 需本地服务 | 用 XHS-Downloader API；cookie 可选 |
 | **微信视频号** | ✅ | ✅ 需登录 | 扫码登录元宝后全自动；未登录只给描述 |
 
@@ -194,7 +212,7 @@ python3 $_S/scripts/video2text --batch urls.txt --out ./out
   "douyin_cookie": "...",
   "xhs_cookie": "...",
   "xhs_api": "http://127.0.0.1:5556",
-  "douk_path": "/path/to/TikTokDownloader",
+  "douk_path": "~/.local/share/video2text/DouK",
   "douyin_api": "http://127.0.0.1:5555"
 }
 ```
@@ -210,7 +228,7 @@ python3 $_S/scripts/video2text --batch urls.txt --out ./out
 | 云端 ASR（可选，中文更准） | <https://bailian.console.aliyun.com/>（Qwen3-ASR-Flash） | `asr_provider` / `asr_api_key` / `asr_base_url` / `asr_model` |
 | 小红书登录态（可选，提高画质） | 浏览器打开 xiaohongshu.com 扫码 | `xhs_cookie`（可用 `--login xhs` 自动写） |
 | 抖音登录态 | 浏览器打开 douyin.com 扫码 | `douyin_cookie`（可用 `--login douyin` 自动写） |
-| 抖音签名/接口 | <https://github.com/JoeanAmier/TikTokDownloader> | `douk_path`（克隆后的目录） |
+| 抖音签名/接口 | <https://github.com/JoeanAmier/TikTokDownloader> | 跑 `--setup-douyin` 自动装并写 `douk_path` |
 
 扫码登录（会弹 Chrome，用户扫完自动落盘）：
 
@@ -252,9 +270,11 @@ whisper 在长静音段会「幻觉」出重复句，脚本默认带 `--hallucin
 ## 排错
 
 - `yt-dlp` 报 403 / 需要登录 → 加 `--cookies-from-browser chrome`
-- 抖音短链 `v.douyin.com` → 先用浏览器打开一次拿最终 URL
+- 抖音链路三件套：`--setup-douyin`（组件）→ `--login douyin`（登录态）→ 跑链接；短链不用手工展开
+- `--status` 里 `douk_path.ready == false` → 跑 `--setup-douyin`（`exists` 为 true 不代表能用）
 - 模型下载慢 → `export HF_ENDPOINT=https://hf-mirror.com`
 - 转写空白 → 确认音频不是纯静音；`--keep-audio` 后用播放器听一下
+- `mlx_whisper produced no srt` + 环境里有 SOCKS 代理（`all_proxy=socks5://…`）→ mlx 的 httpx 缺 socksio，会静默跳过文件。脚本已自动去掉 `all_proxy` 重试一次；仍失败就 `unset all_proxy` 或改用 `--backend api`
 - 视频号 `permission verification failed` → 缺少 `Origin` 头或链接已过期，重跑即可
 
 ## 合规

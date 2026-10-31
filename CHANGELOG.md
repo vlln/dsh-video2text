@@ -1,5 +1,17 @@
 # 更新记录
 
+## 0.2.1 — 2026-10-31
+
+**修复**
+
+- 抖音短链（如 `v.douyin.com/...`）直接失败并抛 `ModuleNotFoundError: No module named 'src'`：根因是 DouK 检出放在 `/tmp/DouK`，被系统清理后只剩一个 `.venv`，而 `--status` 只看目录是否存在，仍报正常。
+- 新增 `--setup-douyin`（幂等安装/修复 DouK：克隆 + `uv sync` + 回写 `douk_path`），检出默认落在 `~/.local/share/video2text/DouK`，不再放 `/tmp`。
+- `--status` 的 `douk_path` 增加 `ready`（校验 `src/interface/detail.py`），`exists` 不再被当作可用。
+- 抖音分支不再因为配置里缺 `douk_path` 就静默退回 yt-dlp（那条路必然 403 并给出误导性的 cookie 报错），改为直接报可操作的 `[service:douyin]` / `[auth:douyin]`。
+- 错误信息取 stderr 最后一行（`tail_error`），不再盲切 300 字符把路径截成半截。
+- 本地转写在 `all_proxy=socks5://…` 的环境里静默失败（`mlx_whisper produced no srt`）：mlx-whisper 的 httpx 缺 socksio 会打印 `Skipping …` 但返回 0。现在检测到这类输出会去掉 `all_proxy` 自动重试一次，仍失败才报错并附原因。
+- npm 安装包里 `skills/video2text/skills/video2text/scripts` 这条软链不会被打进 tarball，装出来 SKILL.md 指不到脚本（0.2.0 就有）：插件加载时按需补一条指向引擎 `scripts/` 的链（只读安装下静默跳过）。
+
 ## 0.2.0 — 2026-10-24
 
 **新增**

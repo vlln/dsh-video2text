@@ -1,6 +1,6 @@
 {
   "name": "dsh-video2text",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "视频链接转文案：侧栏工作台（播放器 + 逐字稿 + 发布导出），自带 video2text skill",
   "type": "module",
   "main": "lib/index.mjs",

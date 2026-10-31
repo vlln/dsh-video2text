@@ -8,7 +8,7 @@
 |---|---|---|---|---|
 | 视频号 | 元宝解析 + `finder-preview` 官方接口 | 逻辑参考 [wx_channels_download](https://github.com/ltaoo/wx_channels_download) | MIT + Commons Clause | ✅ 已跑通 |
 | B站 / YouTube | yt-dlp | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense | ✅ |
-| 抖音 | DouK-Downloader Web API | [JoeanAmier/TikTokDownloader](https://github.com/JoeanAmier/TikTokDownloader) | GPL-3.0 | 设计完成，待接 |
+| 抖音 | DouK-Downloader（本地 `Detail` 调用） | [JoeanAmier/TikTokDownloader](https://github.com/JoeanAmier/TikTokDownloader) | GPL-3.0 | ✅ 已跑通 |
 | 小红书 | XHS-Downloader Web API | [JoeanAmier/XHS-Downloader](https://github.com/JoeanAmier/XHS-Downloader) | GPL-3.0 | 设计完成，待接 |
 | 抖音（备选） | DTK v5（Docker） | [Evil0ctal/Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API) | Apache-2.0 | 备选 |
 | 视频号解密 | 腾讯官方 WASM | [WeChat-Channels-Video-File-Decryption](https://github.com/Evil0ctal/WeChat-Channels-Video-File-Decryption) | MIT | ✅ 已验证 |
@@ -36,10 +36,22 @@ if not detail:
 - 启动 API 模式后监听 `http://127.0.0.1:5555`，自带 `/docs`
 
 ```bash
-git clone https://github.com/JoeanAmier/TikTokDownloader
-cd TikTokDownloader && uv sync
-uv run main.py          # 选择「Web API」模式
+python3 scripts/video2text --setup-douyin    # 克隆 + uv sync，幂等；也可手工装
 ```
+
+`--setup-douyin` 做的事等价于：
+
+```bash
+git clone --depth 1 https://github.com/JoeanAmier/TikTokDownloader ~/.local/share/video2text/DouK
+cd ~/.local/share/video2text/DouK && uv sync
+# 并把 douk_path 写回 ~/.config/video2text/config.json
+```
+
+**别把检出放 `/tmp`**：2026-10-31 现场它被系统清理，只剩一个 `.venv`，调用直接报
+`ModuleNotFoundError: No module named 'src'`（而旧版 `--status` 只看目录存在，报的是「正常」）。
+现在 `douk_path.ready`（检查 `src/interface/detail.py`）才是判据，坏了用 `--setup-douyin` 一条命令修。
+
+不需要起 Web API 服务：skill 直接用 DouK 的 `Detail` 接口（`scripts/douyin_detail.py`），少一个常驻进程。
 
 调用（`src/application/main_server.py` 的 `/douyin/detail`）：
 
@@ -51,10 +63,11 @@ curl -X POST http://127.0.0.1:5555/douyin/detail \
 
 返回作品数据（含播放地址）。下载文件由本 skill 侧完成，便于统一走 16k 抽轨 + ASR。
 
-实测（2026-10）：`--login douyin` 扫码后，把 `UIFID` 注入请求参数、带上完整登录 Cookie，`/aweme/detail` 返回 200，`play_addr.url_list` 可直接下载。skill 通过 `scripts/douyin_detail.py` 调用 DouK 的 `Detail` 接口，配置项：
+实测（2026-10-31，`v.douyin.com/rAmjcwnqMZ0` 短链，24 分半视频）：`--setup-douyin` + `--login douyin` 之后
+短链 → 302 → `aweme_id` → `Detail` 一次拿全，元数据/播放地址都正常。更早（2026-10）的实测：`--login douyin` 扫码后，把 `UIFID` 注入请求参数、带上完整登录 Cookie，`/aweme/detail` 返回 200，`play_addr.url_list` 可直接下载。skill 通过 `scripts/douyin_detail.py` 调用 DouK 的 `Detail` 接口，配置项：
 
 ```json
-{ "douk_path": "/path/to/TikTokDownloader", "douyin_cookie": "..." }
+{ "douk_path": "~/.local/share/video2text/DouK", "douyin_cookie": "..." }
 ```
 
 只带 `a_bogus`、没有 `uifid`/`msToken` 仍会 `403 Uifid Not Found`——签名只是必要条件，身份 Cookie 才是前提。

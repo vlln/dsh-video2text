@@ -87,6 +87,7 @@ python3 scripts/video2text "https://www.bilibili.com/video/BV…" --out ./out
 
 - WeChat Channels depends on a Tencent Yuanbao session; when it expires the task asks you to sign in again.
 - Douyin needs DouK-Downloader plus a local cookie; Xiaohongshu uses a local XHS-Downloader service (falls back to yt-dlp, with less coverage).
+- Install DouK once with `video2text --setup-douyin` (idempotent; defaults to `~/.local/share/video2text/DouK`). Do not keep it under `/tmp` — the system cleans it and jobs then fail with `[service:douyin]`.
 - YouTube returns a bot check without a signed-in session: set a browser cookie, or run bgutil (`docker run -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider`) plus its yt-dlp plugin and put the URL into "YouTube PO token". A PO token does **not** bypass IP-level blocks — datacenter egress still needs cookies. Details: [docs/youtube.md](docs/youtube.md).
 - Long cloud transcriptions are dominated by server-side queueing (a 16-minute video took ~4 minutes); chunk size barely matters.
 - One session per platform; no multi-account support yet.

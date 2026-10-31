@@ -43,6 +43,15 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
+def tail_error(text: str, limit: int = 300) -> str:
+    """取报错的「最后一行」而不是盲切尾部：截断后仍是完整的一句错误。"""
+    lines = [ln.strip() for ln in (text or "").strip().splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    last = lines[-1]
+    return last[-limit:] if len(last) > limit else last
+
+
 def have(binary: str) -> bool:
     return shutil.which(binary) is not None
 
@@ -578,11 +587,19 @@ def asr_transcribe(wav: Path, backend: str, model: str | None, lang: str,
         if lang and lang != "auto":
             cmd += ["--language", lang]
         p = run(cmd)
+        produced = list(outdir.glob("*.srt")) if p.returncode == 0 else []
+        if p.returncode == 0 and not produced and _socks_hint(p):
+            # mlx-whisper 的 httpx 不认 SOCKS 代理：会打印 Skipping … 然后**返回 0**、
+            # 一个 srt 都不写。去掉 all_proxy 再试一次（模型已缓存时不需要网络）。
+            log("mlx 被 SOCKS 代理挡住（httpx 缺 socksio），去掉 all_proxy 重试一次…")
+            p = run(cmd, env=_without_socks_proxy())
+            produced = list(outdir.glob("*.srt")) if p.returncode == 0 else []
         if p.returncode != 0:
-            raise RuntimeError(f"mlx_whisper failed: {p.stderr[-800:]}")
-        produced = list(outdir.glob("*.srt"))
+            raise RuntimeError(f"mlx_whisper failed: {tail_error(p.stderr)}")
         if not produced:
-            raise RuntimeError("mlx_whisper produced no srt")
+            extra = "（环境里有 SOCKS 代理，mlx 的 httpx 缺 socksio：unset all_proxy，或改用 --backend api）" \
+                if _socks_hint(p) else ""
+            raise RuntimeError(f"mlx_whisper produced no srt：{tail_error(_out_text(p))}{extra}")
         produced[0].replace(srt)
     elif backend == "whispercpp":
         p = run(["whisper-cli", "-m", model or "models/ggml-large-v3-turbo.bin",
@@ -593,6 +610,23 @@ def asr_transcribe(wav: Path, backend: str, model: str | None, lang: str,
         raise ValueError(f"unknown backend {backend}")
     segs = parse_srt(srt)
     return apply_fixes(segs, fixes or {})
+
+
+def _out_text(p: subprocess.CompletedProcess) -> str:
+    return "\n".join(x for x in (p.stdout or "", p.stderr or "") if x)
+
+
+def _socks_hint(p: subprocess.CompletedProcess) -> bool:
+    text = _out_text(p)
+    return "socksio" in text or "SOCKS proxy" in text
+
+
+def _without_socks_proxy() -> dict:
+    env = dict(os.environ)
+    for key in ("all_proxy", "ALL_PROXY"):
+        if env.get(key, "").lower().startswith("socks"):
+            env.pop(key, None)
+    return env
 
 
 def apply_fixes(segs: list[dict], fixes: dict[str, str]) -> list[dict]:
@@ -778,6 +812,76 @@ def site_login(platform: str, timeout: int = 240) -> Path:
 
 # ---------------------------------------------------------------- douyin
 
+DOUK_REPO = "https://github.com/JoeanAmier/TikTokDownloader.git"
+# 装在家目录而不是 /tmp：/tmp 会被系统清理（2026-10-31 现场：只剩一个 .venv，
+# 于是 douyin_detail.py 报 No module named 'src'）。
+DOUK_DEFAULT = Path(os.environ.get("VIDEO2TEXT_HOME")
+                    or Path.home() / ".local" / "share" / "video2text") / "DouK"
+DOUK_ENTRY = Path("src") / "interface" / "detail.py"
+
+
+def douk_path() -> Path:
+    """DouK 检出目录：配置项优先，未配置时用 ~/.local/share/video2text/DouK。"""
+    return Path(cfg("DOUK_PATH") or DOUK_DEFAULT).expanduser()
+
+
+def douk_state(path: Path | str | None = None) -> dict:
+    """`ready` 才是能用的判据：目录存在 ≠ 检出完整。"""
+    p = Path(path).expanduser() if path else douk_path()
+    if (p / DOUK_ENTRY).is_file():
+        return {"path": str(p), "exists": True, "ready": True, "detail": "可用"}
+    if not p.exists():
+        detail = "未安装（运行 --setup-douyin 自动安装）"
+    elif not (p / ".git").is_dir():
+        detail = "目录在但缺 src/，不是完整检出（运行 --setup-douyin 修复）"
+    else:
+        detail = f"检出缺 {DOUK_ENTRY}（运行 --setup-douyin 修复）"
+    return {"path": str(p), "exists": p.exists(), "ready": False, "detail": detail}
+
+
+def setup_douk(path: Path | str | None = None) -> int:
+    """安装 / 修复 DouK 检出并写入配置（幂等）。"""
+    p = Path(path).expanduser() if path else douk_path()
+    if douk_state(p)["ready"]:
+        save_config({"douk_path": str(p)})
+        log(f"DouK 已就绪：{p}")
+        print(json.dumps(douk_state(p), ensure_ascii=False, indent=2))
+        return 0
+    if not have("git"):
+        raise RuntimeError("需要 git：brew install git")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.exists() and (p / ".git").is_dir():
+        log(f"修复已有检出：{p}")
+        for cmd in (["git", "-C", str(p), "fetch", "--depth", "1", "origin"],
+                    ["git", "-C", str(p), "reset", "--hard", "FETCH_HEAD"],
+                    ["git", "-C", str(p), "clean", "-fdx", "-e", ".venv"]):
+            r = run(cmd)
+            if r.returncode != 0:
+                raise RuntimeError(f"{' '.join(cmd)} 失败：{tail_error(r.stderr)}")
+    elif p.exists() and any(p.iterdir()):
+        raise RuntimeError(
+            f"{p} 已存在但不是 git 检出（可能只删剩 .venv）。"
+            f"把它移走或删掉后重跑 --setup-douyin；或在配置里把 douk_path 指到别的目录。")
+    else:
+        log(f"克隆 DouK 到 {p} …")
+        r = run(["git", "clone", "--depth", "1", DOUK_REPO, str(p)])
+        if r.returncode != 0:
+            raise RuntimeError(f"git clone 失败：{tail_error(r.stderr)}")
+    if not have("uv"):
+        raise RuntimeError("需要 uv 安装 DouK 依赖：brew install uv")
+    log("安装依赖（uv sync，首次约 1–2 分钟）…")
+    r = run(["uv", "sync"], cwd=str(p))
+    if r.returncode != 0:
+        raise RuntimeError(f"uv sync 失败：{tail_error(r.stderr)}")
+    state = douk_state(p)
+    if not state["ready"]:
+        raise RuntimeError(f"安装后仍缺 {DOUK_ENTRY}：{p}")
+    save_config({"douk_path": str(p)})
+    log(f"DouK 就绪：{p}（已写入配置 douk_path）")
+    print(json.dumps(state, ensure_ascii=False, indent=2))
+    return 0
+
+
 def resolve_douyin(url: str) -> str:
     m = re.search(r"/(?:video|note)/(\d{15,})", url)
     if m:
@@ -819,20 +923,30 @@ def douyin_cookie_status() -> dict:
 
 
 def douyin_item(url: str) -> dict:
-    douk = cfg("DOUK_PATH")
+    douk = douk_path()
+    state = douk_state(douk)
+    if not state["ready"]:
+        raise RuntimeError(
+            f"[service:douyin] 抖音解析组件（DouK）不可用：{douk} · {state['detail']}。"
+            f"运行 `python3 {Path(__file__).resolve()} --setup-douyin` 自动安装/修复")
     cookie = cfg("DOUYIN_COOKIE")
-    if not douk or not cookie:
-        raise RuntimeError("需要 DOUK_PATH 与 DOUYIN_COOKIE（见 docs/backends.md）")
-    state = douyin_cookie_status()
-    if not state["ok"]:
-        raise RuntimeError(f"抖音{state['detail']}，请运行 --login douyin 重新扫码")
+    if not cookie:
+        raise RuntimeError("[auth:douyin] 未配置抖音登录态，运行 --login douyin 扫码")
+    login = douyin_cookie_status()
+    if not login["ok"]:
+        raise RuntimeError(f"[auth:douyin] 抖音{login['detail']}，请运行 --login douyin 重新扫码")
+    if not have("uv"):
+        raise RuntimeError("[service:douyin] 需要 uv 来运行 DouK：brew install uv")
     aweme_id = resolve_douyin(url)
     helper = Path(__file__).resolve().parent / "douyin_detail.py"
     env = dict(os.environ)
-    p = run(["uv", "run", "python", str(helper), aweme_id, douk, cookie],
-            cwd=douk, env=env)
+    p = run(["uv", "run", "python", str(helper), aweme_id, str(douk), cookie],
+            cwd=str(douk), env=env)
     if p.returncode != 0:
-        err = (p.stderr or "").strip()[-300:] or "douyin detail failed"
+        err = tail_error(p.stderr) or "douyin detail failed"
+        if "No module named" in err and "src" in err:
+            raise RuntimeError(
+                f"[service:douyin] DouK 检出缺 src/（{douk}）：{err}。运行 --setup-douyin 修复")
         if "403" in err or "Uifid" in err or "登录" in err:
             raise RuntimeError("[auth:douyin] 抖音登录态失效或被风控（403/Uifid），需要重新扫码登录")
         raise RuntimeError(err)
@@ -1739,8 +1853,7 @@ def warm_model(model: str) -> int:
 def check_status() -> int:
     info = {"config": str(CONFIG_PATH), "config_exists": CONFIG_PATH.exists()}
     info["douyin_login"] = douyin_cookie_status()
-    douk = cfg("DOUK_PATH")
-    info["douk_path"] = {"path": douk, "exists": bool(douk and Path(douk).exists())}
+    info["douk_path"] = douk_state()
     api = cfg("XHS_API") or "http://127.0.0.1:5556"
     try:
         req = urllib.request.Request(api + "/docs", method="GET")
@@ -2123,6 +2236,8 @@ def main() -> int:
     ap.add_argument("--cookie", help="视频号：腾讯元宝(yuanbao.tencent.com)登录后的 Cookie；@file 从文件读")
     ap.add_argument("--login-wechat", action="store_true", help="打开浏览器扫码登录腾讯元宝，保存 Cookie 后退出")
     ap.add_argument("--login", choices=["douyin", "xhs"], help="扫码登录抖音/小红书，Cookie 写入固定配置")
+    ap.add_argument("--setup-douyin", action="store_true",
+                    help="安装/修复抖音解析组件 DouK（克隆到 ~/.local/share/video2text/DouK 并装依赖）")
     ap.add_argument("--wechat-session", action="store_true",
                     help="视频号：开浏览器扫码登录，登录态内直接解析（Cookie 只作兜底）")
     ap.add_argument("--login-timeout", type=int, default=240, help="登录等待秒数 (default 240)")
@@ -2174,6 +2289,13 @@ def main() -> int:
 
     if args.status:
         return check_status()
+
+    if args.setup_douyin:
+        try:
+            return setup_douk()
+        except Exception as e:
+            log(f"setup error: {e}")
+            return 2
 
     if args.warm_model is not None:
         try:
@@ -2283,7 +2405,7 @@ def main() -> int:
                 media_src = src
             wav = work / "audio16k.wav"
             ffmpeg_to_wav(src, wav, args.max_seconds)
-        elif platform == "douyin" and cfg("DOUK_PATH") and cfg("DOUYIN_COOKIE"):
+        elif platform == "douyin":
             log("[1/3] 抖音：走 DouK 签名 + 登录态…")
             meta, video = douyin_fetch(ident, work)
             media_src = video

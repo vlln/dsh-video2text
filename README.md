@@ -174,6 +174,7 @@ YouTube 对无登录态请求返回 `Sign in to confirm you're not a bot`。社�
 ## 已知限制
 
 - 平台登录态会过期：视频号（元宝）、抖音（DouK + Cookie）、小红书（本地 XHS-Downloader）。失效时任务进入「需要登录」，卡片上扫码即可。
+- 抖音要先装 DouK 解析组件：`video2text --setup-douyin`（默认装到 `~/.local/share/video2text/DouK`，幂等，坏了也能修）。别装 `/tmp`——会被系统清理，之后任务会报 `[service:douyin]`，账号卡片上会标「缺 src/」。
 - 长视频的云端转写受服务端排队影响（16 分钟视频约 4 分钟），分片大小不是瓶颈。
 - 一个平台一份登录态，暂不支持多账号并存。
 - 只在 dsh `0.2.1-rc.1` 上验证通过，其它版本未验证。
