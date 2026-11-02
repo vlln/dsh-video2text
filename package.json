@@ -1,7 +1,7 @@
 {
   "name": "dsh-video2text",
   "version": "0.2.2",
-  "description": "视频链接转文案：侧栏工作台 + 给 agent 的视频理解工具（video_text / video_frames）",
+  "description": "面板做视频链接转文案；工具给 agent 看视频（video_text / video_frames）。两行可分别禁用。",
   "type": "module",
   "main": "lib/index.mjs",
   "icon": "./icon.svg",
