@@ -18,6 +18,11 @@
 
 - README 中英各加「给 Agent 用」一节；SKILL 增加 `--inspect` 用法与 `shots` 的取舍说明。
 
+**面板**
+
+- 任务菜单（三个点）新增「在文件夹中显示视频」与「打开任务目录」：走新路由 `/reveal`，按平台调用 `open -R` / `explorer /select,` / `xdg-open`，只接受已存在的任务 id。
+- 修了同一菜单里「复制链接」的 `copy is not defined`：它误用了 Viewer 作用域里的 copy，现在 Panel 有自己的 `copyText`。
+
 **设置**
 
 - 插件配置新增 `showEntry`（默认开）：在 DSH 的 Plugins 页关掉它只隐藏侧栏入口，agent 工具（`dsh-video2text/inspect` 行）不受影响；要彻底停用面板则禁用整行。

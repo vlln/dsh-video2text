@@ -70,7 +70,7 @@ Self-check after installing: `python3 ~/.claude/skills/video2text/scripts/video2
 | Player | Custom controls, synced transcript, subtitles, PiP, fullscreen |
 | Export | Publish draft / SRT / ZIP |
 | Accounts | Douyin & Xiaohongshu QR sign-in; WeChat Channels sign-in + session check |
-| Jobs | Search, day groups, retry-in-place, delete, import from other folders |
+| Jobs | Search, day groups, retry-in-place, delete, import from other folders; reveal the video or open the task folder from the row menu |
 | Agent handoff | "Ask AI" opens a session in the task workspace with context pre-filled |
 
 ## For agents (`video_text` / `video_frames`)
