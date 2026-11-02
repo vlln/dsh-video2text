@@ -173,6 +173,7 @@ cp -R skills/video2text/scripts ~/.claude/skills/video2text/
 - 缓存：`$DSH_HOME/data/dsh-video-inspect/<vid>/`（媒体、转写、拼图、请求结果各一份），与面板的 `out/` 无关。
 - 关掉面板（`- id: dsh-video2text` + `disabled: true`）后，这两个工具照常工作。
 - 只想隐藏侧栏入口、不想动插件行：在 DSH 的 **Plugins** 页找到 `dsh-video2text`，把配置项 `showEntry` 关掉，刷新页面生效——agent 工具不受影响。
+- 登录态与各项设置统一在 **Settings → 视频转文案**；插件页只留 `showEntry` 一个开关。
 
 ```yaml
 # cordis.patch.yml 里两行，可分别开关
