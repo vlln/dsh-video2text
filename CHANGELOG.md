@@ -1,3 +1,23 @@
+## 0.2.2 — 2026-11-02
+
+**新增**
+
+- 新增 `dsh-video2text/inspect` 插件行（与面板互相独立，可单独 disabled）：给 agent 的 `video_text` / `video_frames` 工具。
+  - 传媒体路径或 `vid_<8hex>` 句柄；同一素材只跑一次（重复/并发请求复用同一个后台任务）。
+  - 25 秒软超时自动转 `v2t-video` 后台任务（走 `ctx.jobs`，完成有会话内通知），再用同一 vid 取结果；命中缓存直接返回；无 `jobs` 服务时降级为同步执行。
+  - `video_frames` 返回拼图 + 每格时间点；`detail`/`at` 返回高清单帧；图片作为 attachments 附件交给模型。
+  - 宿主重启留下的未完成任务会被标记为「上次准备被中断」并自动重跑。
+- 引擎新增 `--inspect`：ffprobe 探测 + 按画面变化取帧（dHash）+ 帧→时间映射 + 缓存 + `[video:xxx]` 可读报错。
+- 面板行为不变：`render_sheet()` 重构后与旧版逐像素一致（同一参数下 JPG md5 相同，已对比验证）。
+
+**修复**
+
+- `lib/inspect.mjs` 未 unwrap cordis 的 Config ref，`spawn(python)` 拿到对象并抛 `path argument must be of type string`（真实 agent 调用时暴露）。
+
+**文档**
+
+- README 中英各加「给 Agent 用」一节；SKILL 增加 `--inspect` 用法与 `shots` 的取舍说明。
+
 # 更新记录
 
 ## 0.2.1 — 2026-10-31

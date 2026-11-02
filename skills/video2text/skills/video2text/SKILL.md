@@ -49,6 +49,10 @@ python3 $_S/scripts/video2text --from-file ~/Desktop/wechat.mov --out ./out
 --wechat-session                # 视频号：弹窗扫码 → 登录态内解析 → 自动跑完
 --login douyin|xhs              # 扫码登录并写入固定配置（推荐）
 --setup-douyin                  # 安装/修复抖音解析组件 DouK（幂等，坏了一次修好）
+--inspect <媒体>                # 给 agent：探测 + 抽帧拼图，输出帧→时间映射（--json 给程序）
+--start/--end/--at              # inspect 的时间窗 / 单帧时刻
+--mode shots|uniform            # inspect 取帧策略（默认 shots：只留画面真的变了的帧）
+--size overview|detail          # inspect 输出拼图 / 单帧高清
 --cookies-from-browser chrome   # 备用：直接读浏览器 Cookie
 --max-seconds 60                # 只跑前 60 秒，先看质量
 --model mlx-community/whisper-large-v3-turbo   # 下载慢可用 -q4 量化版
@@ -90,6 +94,29 @@ python3 $_S/scripts/video2text --export ./out --format publish
 章节按停顿和长度切（约 35–100 秒一段），小标题取该段开头一句，目的是「一眼能改」。
 
 `examples/` 里有真实产出样例；`prompts/polish.md` 是逐字稿润色提示词。
+
+## 让 agent 看画面（`--inspect`）
+
+`--inspect` 是给 agent 的「理解视频」入口：探测容器 → 按画面变化取帧 → 拼成一张图 → 同时给出每格的时间点（`--json` 输出结构化映射）。
+
+```bash
+# 整条视频的画面概览（默认 shots：只保留画面真的变了的帧）
+python3 $_S/scripts/video2text --inspect ~/Movies/talk.mp4
+
+# 只看 60–180 秒，仍按变化取帧
+python3 $_S/scripts/video2text --inspect ~/Movies/talk.mp4 --start 60 --end 180
+
+# 某一秒的高清单帧（读幻灯片上的小字）
+python3 $_S/scripts/video2text --inspect ~/Movies/talk.mp4 --at 62.1
+
+# 给程序用：帧→时间/格子坐标、拼图路径、缓存命中
+python3 $_S/scripts/video2text --inspect ~/Movies/talk.mp4 --json
+```
+
+- `shots` 用 dHash 感知哈希找变化点（**不要用 ffmpeg 的 `scene` 滤镜**：实测一条 24 分钟幻灯片教程全片只报 2 处，而 dHash 能看出 24 处以上）。
+- 画面变化少于 4 处（纯口播/静态）会自动按等间隔补齐到 8 帧，并在输出里注明。
+- 纯音频会明确报 `[video:no-video-stream]`；文件缺失/不是容器/坏区间都有对应 `[video:xxx]` 前缀。
+- 同一个请求第二次直接命中缓存（`~/.cache/video2text/inspect`，可用 `--cache-dir` 改）。
 
 ## Agent 执行流程（重要）
 

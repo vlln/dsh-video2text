@@ -71,6 +71,24 @@ Self-check after installing: `python3 ~/.claude/skills/video2text/scripts/video2
 | Jobs | Search, day groups, retry-in-place, delete, import from other folders |
 | Agent handoff | "Ask AI" opens a session in the task workspace with context pre-filled |
 
+## For agents (`video_text` / `video_frames`)
+
+The package also ships a panel-independent plugin row, `dsh-video2text/inspect`, exposing two tools:
+
+| Tool | Input | Output |
+|---|---|---|
+| `video_text` | media path or `vid_xxxxxxxx`, optional `from`/`to` | timestamped transcript lines; starts a background job if not transcribed yet |
+| `video_frames` | same, plus `mode` (shots/uniform), `size` (overview/detail), `at` | one contact sheet with per-cell timestamps, or one high-resolution frame |
+
+Behaviour:
+
+- **No job ids to learn**: pass a media path once; the tool returns `vid_<8hex>` derived from the file fingerprint, and every later call can use it.
+- **25 s soft deadline**: transcription or long-video sampling beyond that becomes a background job (`v2t-video-<id>`) with an in-session completion notice; the call returns `status: running` immediately and the same vid fetches the result later.
+- **One job per asset**: repeated or concurrent requests reuse the running job instead of re-transcribing.
+- `mode: shots` keeps only frames whose picture actually changed (slides, screens, subtitle switches) using dHash, not ffmpeg's `scene` filter.
+- Cache lives in `$DSH_HOME/data/dsh-video-inspect/<vid>/`, separate from the panel's `out/`.
+- Disabling the panel row keeps both tools working.
+
 ## Where data lives
 
 | Item | Path |

@@ -1,4 +1,9 @@
-# dsh-video2text：向组合挂 Node half（工具 + 面板数据路由）
+# dsh-video2text：两行可独立开关的插件
+#   dsh-video2text         面板 + /sheet 等数据路由（人用）
+#   dsh-video2text/inspect  video_text / video_frames 工具（agent 用，不依赖面板）
 - insert:
     - id: dsh-video2text
       name: 'dsh-video2text'
+
+    - id: dsh-video2text-inspect
+      name: 'dsh-video2text/inspect'

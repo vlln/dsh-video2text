@@ -1,6 +1,6 @@
 {
   "name": "dsh-video2text",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "视频链接转文案：侧栏工作台（播放器 + 逐字稿 + 发布导出），自带 video2text skill",
   "type": "module",
   "main": "lib/index.mjs",
@@ -20,6 +20,9 @@
   "exports": {
     ".": {
       "default": "./lib/index.mjs"
+    },
+    "./inspect": {
+      "default": "./lib/inspect.mjs"
     },
     "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",

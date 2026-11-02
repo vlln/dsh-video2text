@@ -2099,33 +2099,26 @@ def auto_sheet_count(span: float, target: int = 48) -> tuple[int, float]:
     return max(2, min(96, count)), step
 
 
-def render_sheet(media: Path, out: Path, start: float = 0.0, end: float | None = None,
-                 count: int | None = None, cols: int = 8, width: int = 320,
-                 title: str = "", quality: int = 88) -> Path:
-    """区间等间隔抽 N 帧 → 拼版 → 写时间戳与页眉，输出一张 JPG。
-
-    逐帧抽（而不是一刀 `fps` 滤镜）是为了**正好 N 帧**：fps 滤镜会按帧率四舍五入，
-    出现空格子或黑块。逐帧 seek 对长视频也很快。
-    """
-    total = media_duration(media)
-    end = total if end is None else min(end, total)
-    start = max(0.0, min(start, max(0.0, end - 0.2)))
+def sheet_times(start: float, end: float, count: int) -> list[float]:
+    """区间等间隔取 N 个采样点（取格子中心，避开首尾黑帧）。"""
     span = max(0.2, end - start)
-    if count is None:
-        count, _ = auto_sheet_count(span)
-    count = max(1, min(int(count), 96))
-    cols = max(1, min(int(cols), count))
-    rows = (count + cols - 1) // cols
+    return [start + span * (i + 0.5) / count for i in range(count)]
 
+
+def _draw_sheet(media: Path, times: list[float], out: Path, width: int = 320, cols: int = 8,
+                title: str = "", quality: int = 88, header_note: str = "") -> dict:
+    """按给定时刻抽帧 → 拼版；返回 {path, cols, rows, cell, header, frames}。"""
     from PIL import Image, ImageDraw, ImageFont
     import tempfile
 
+    if not times:
+        raise RuntimeError("没有抽到任何帧")
     font = _sheet_font(ImageFont, size=max(11, width // 22))
     small = _sheet_font(ImageFont, size=max(10, width // 26))
     frames: list[Image.Image] = []
+    kept: list[float] = []
     with tempfile.TemporaryDirectory() as tmpdir:
-        for i in range(count):
-            t = start + span * (i + 0.5) / count
+        for i, t in enumerate(times):
             dst = Path(tmpdir) / f"f{i:03d}.jpg"
             p = run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.3f}", "-i", str(media),
                      "-frames:v", "1", "-vf", f"scale={width}:-2:flags=lanczos",
@@ -2140,24 +2133,326 @@ def render_sheet(media: Path, out: Path, start: float = 0.0, end: float | None =
                         fill=(0, 0, 0, 150))
             d.text((11, img.height - small.size - 12), label, font=small, fill=(255, 255, 255, 235))
             frames.append(img)
+            kept.append(t)
 
     if not frames:
         raise RuntimeError("没有抽到任何帧")
+    cols = max(1, min(int(cols), len(frames)))
+    rows = (len(frames) + cols - 1) // cols
     tile_w = max(f.width for f in frames)
     tile_h = max(f.height for f in frames)
-    rows = (len(frames) + cols - 1) // cols
     header = 34
     canvas = Image.new("RGB", (tile_w * cols, tile_h * rows + header), (18, 18, 20))
     for i, img in enumerate(frames):
         r, c = divmod(i, cols)
         canvas.paste(img, (c * tile_w, header + r * tile_h))
     d2 = ImageDraw.Draw(canvas)
-    info = (f"{title[:70]}   ·   {start:.0f}–{end:.0f}s / {total:.0f}s"
-            f"   ·   {len(frames)} 帧 · {cols}×{rows}   ·   {span / max(1, len(frames)):.2f}s 一帧")
-    d2.text((12, 9), info, font=font, fill=(235, 235, 238))
+    d2.text((12, 9), f"{title[:70]}   ·   {header_note}", font=font, fill=(235, 235, 238))
     out.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out, "JPEG", quality=quality, optimize=True)
+    return {"path": str(out), "cols": cols, "rows": rows, "cell": [tile_w, tile_h],
+            "header": header, "frames": kept}
+
+
+def render_sheet(media: Path, out: Path, start: float = 0.0, end: float | None = None,
+                 count: int | None = None, cols: int = 8, width: int = 320,
+                 title: str = "", quality: int = 88) -> Path:
+    """区间等间隔抽 N 帧 → 拼版 → 写时间戳与页眉，输出一张 JPG。
+
+    逐帧抽（而不是一刀 `fps` 滤镜）是为了**正好 N 帧**：fps 滤镜会按帧率四舍五入，
+    出现空格子或黑块。逐帧 seek 对长视频也很快。
+
+    面板（`/sheet` 路由）走这条路径；它的签名与输出保持原样，agent 侧走 `inspect_media`。
+    """
+    total = media_duration(media)
+    end = total if end is None else min(end, total)
+    start = max(0.0, min(start, max(0.0, end - 0.2)))
+    span = max(0.2, end - start)
+    if count is None:
+        count, _ = auto_sheet_count(span)
+    count = max(1, min(int(count), 96))
+    cols_eff = max(1, min(int(cols), count))
+    rows_eff = (count + cols_eff - 1) // cols_eff
+    note = (f"{start:.0f}–{end:.0f}s / {total:.0f}s"
+            f"   ·   {count} 帧 · {cols_eff}×{rows_eff}"
+            f"   ·   {span / count:.2f}s 一帧")
+    _draw_sheet(media, sheet_times(start, end, count), out, width=width, cols=cols,
+                title=title, quality=quality, header_note=note)
     return out
+
+
+# ---------------------------------------------------------------- inspect
+# Agent 侧的「理解视频」：探测容器 → 按 shots|uniform 取帧 → 拼图 → 返回帧→时间映射。
+# 只新增函数，不改 render_sheet 的行为（面板的 /sheet 路由照旧）。
+
+INSPECT_LIMIT_TILES = 24      # 单张最多几格（再多模型也读不动）
+INSPECT_FILL_MIN = 4          # shots 帧数少于这个就认为「画面变化少」
+INSPECT_FILL_TO = 8           # 补齐到几帧
+INSPECT_CHANGE = 10           # 相邻保留帧的 dHash 汉明距离阈值（64 位里差几位算换了画面）
+
+
+def _video_error(code: str, message: str) -> RuntimeError:
+    """`[video:<code>]` 前缀给程序判定，后半句给人/模型看。"""
+    return RuntimeError(f"[video:{code}] {message}")
+
+
+def video_id(path: Path) -> str:
+    """媒体指纹 → `vid_<8hex>`：同一文件永远同一个 id，文件被替换就换新。"""
+    st = path.stat()
+    h = hashlib.sha1(f"{path.resolve()}|{st.st_mtime_ns}|{st.st_size}".encode()).hexdigest()
+    return "vid_" + h[:8]
+
+
+def probe_media(path: Path) -> dict:
+    """ffprobe 探测：容器、时长、分辨率、帧率、音视频流。每类失败都给可读原因。"""
+    path = Path(path).expanduser()
+    if not path.exists():
+        raise _video_error("not-found", f"找不到 {path}。传媒体文件路径，或之前返回的 vid_<8位hex>。")
+    if path.is_dir():
+        raise _video_error("is-dir", f"{path} 是目录，不是媒体文件。")
+    p = run(["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_streams", "-show_format", str(path)])
+    if p.returncode != 0:
+        raise _video_error(
+            "not-media",
+            f"{path.name} 不是可识别的音视频容器（ffprobe 失败）。支持 mp4/mov/m4v/mkv/webm/avi/flv/ts/wmv。")
+    try:
+        data = json.loads(p.stdout or "{}")
+    except ValueError:
+        raise _video_error("not-media", f"{path.name} 的 ffprobe 输出无法解析，文件可能损坏。")
+    streams = data.get("streams") or []
+    video = next((x for x in streams if x.get("codec_type") == "video"), None)
+    audio = next((x for x in streams if x.get("codec_type") == "audio"), None)
+    try:
+        duration = float((data.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        duration = media_duration(path)
+    fps = 0.0
+    if video:
+        rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1"
+        try:
+            num, _, den = str(rate).partition("/")
+            fps = round(float(num) / float(den or 1), 3)
+        except (TypeError, ValueError, ZeroDivisionError):
+            fps = 0.0
+    return {
+        "path": str(path),
+        "id": video_id(path),
+        "size": path.stat().st_size,
+        "duration": round(duration, 3),
+        "width": int(video.get("width") or 0) if video else 0,
+        "height": int(video.get("height") or 0) if video else 0,
+        "fps": fps,
+        "vcodec": (video.get("codec_name") or "") if video else "",
+        "has_video": bool(video),
+        "has_audio": bool(audio),
+    }
+
+
+def _dhash_frame(buf: bytes, w: int, h: int) -> int:
+    """把一帧灰度原始像素压成 64 位 dHash（8×8 相邻比较）。"""
+    bits = 0
+    prev_row = -1
+    row_bits = 0
+    for r in range(8):
+        py = min(h - 1, r * h // 8)
+        if py != prev_row:
+            prev_row = py
+            row_bits = 0
+            base = py * w
+            for c in range(8):
+                x1 = min(w - 1, c * w // 8)
+                x2 = min(w - 1, (c + 1) * w // 8)
+                row_bits = (row_bits << 1) | (1 if buf[base + x1] > buf[base + x2] else 0)
+        bits = (bits << 8) | row_bits
+    return bits
+
+
+def _hamming(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
+
+
+def shot_times(media: Path, start: float, end: float, change: int = INSPECT_CHANGE,
+               min_gap: float = 3.0, limit: int = INSPECT_LIMIT_TILES,
+               probe: dict | None = None) -> tuple[list[float], bool]:
+    """按「画面真的变了」取帧：单次解码到 160px 灰度 → 逐帧 dHash → 只留变化点。
+
+    为什么不用 ffmpeg 的 `scene` 滤镜：它对幻灯片式的慢过渡很不敏感（实测一条
+    24 分钟教程全片只报 2 处，而 dHash 能看出几十处变化）。dHash 还能同时完成
+    「去重」——相邻帧不变就不重复出图。
+    """
+    span = max(0.2, end - start)
+    # 采样密度：长区间 2s 一帧，短区间更密（不少于 0.5s）
+    interval = max(0.5, min(2.0, span / 240.0))
+    info = probe or probe_media(media)
+    src_w = info.get("width") or 16
+    src_h = info.get("height") or 9
+    w = 160
+    h = max(2, int(round(src_h * w / max(1, src_w) / 2.0)) * 2)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{start:.3f}",
+           "-to", f"{end:.3f}", "-i", str(media), "-an", "-sn",
+           "-vf", f"fps={1.0 / interval:.6f},scale={w}:{h}:flags=fast_bilinear,format=gray",
+           "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    proc = subprocess.run(cmd, capture_output=True)
+    raw = proc.stdout or b""
+    size = w * h
+    count = len(raw) // size if size else 0
+    marks: list[float] = [round(start, 2)]
+    last = _dhash_frame(raw[0:size], w, h) if count else 0
+    for i in range(1, count):
+        cur = _dhash_frame(raw[i * size:(i + 1) * size], w, h)
+        t = start + i * interval
+        if _hamming(cur, last) >= change and t - marks[-1] >= min_gap:
+            marks.append(round(t, 2))
+            last = cur
+    if count and end - marks[-1] > 1.5:
+        marks.append(round(end - 0.3, 2))
+
+    filled = False
+    if len(marks) < INSPECT_FILL_MIN and span > 20:
+        merged = sorted(set(marks) | set(sheet_times(start, end, INSPECT_FILL_TO)))
+        dedup: list[float] = []
+        for t in merged:
+            if not dedup or t - dedup[-1] >= min_gap:
+                dedup.append(t)
+        marks = dedup
+        filled = True
+
+    if len(marks) > limit:
+        step = (len(marks) - 1) / (limit - 1)
+        marks = [marks[round(i * step)] for i in range(limit)]
+    return [round(t, 2) for t in marks], filled
+
+
+def _frame_at(media: Path, t: float, out: Path, width: int = 1280) -> dict:
+    """抽单帧（detail 用），默认 1280 宽，不放大源图。"""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    p = run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.3f}", "-i", str(media),
+             "-frames:v", "1", "-vf", f"scale='min({int(width)},iw)':-2:flags=lanczos",
+             "-q:v", "3", str(out)])
+    if p.returncode != 0 or not out.exists():
+        raise _video_error("undecodable",
+                           f"能在 {t:.1f}s 定位但抽帧失败（编码可能不受支持）。换 mp4/mov，或先用 ffmpeg 转码。")
+    return {"path": str(out), "t": round(t, 2)}
+
+
+def _inspect_cache_dir(cache_dir: Path | str | None) -> Path:
+    if cache_dir:
+        return Path(cache_dir).expanduser()
+    base = os.environ.get("VIDEO2TEXT_CACHE") or (Path.home() / ".cache" / "video2text")
+    return Path(base) / "inspect"
+
+
+def inspect_media(media: Path, start: float | None = None, end: float | None = None,
+                  mode: str = "shots", size: str = "overview", at: float | None = None,
+                  count: int | None = None, width: int = 480, cols: int = 4,
+                  cache_dir: Path | str | None = None, change: int = INSPECT_CHANGE) -> dict:
+    """给 agent 用的媒体理解入口：返回拼图/单帧路径 + 帧→时间映射。"""
+    path = Path(media).expanduser()
+    info = probe_media(path)
+    if not info["has_video"]:
+        raise _video_error(
+            "no-video-stream",
+            f"{path.name} 只有音轨，没有画面。文字稿可以出，抽帧不可用。")
+    total = info["duration"]
+    s0 = 0.0 if start is None else max(0.0, float(start))
+    e0 = total if end is None else min(float(end), total)
+    if e0 <= s0:
+        raise _video_error("bad-range",
+                           f"区间无效：{s0:.1f}s–{e0:.1f}s（视频时长 {total:.1f}s）。")
+
+    # detail：单帧高清，区间无意义（at 缺省取 start）
+    if size == "detail" or at is not None:
+        t = float(at if at is not None else s0)
+        if t < 0 or (total and t > total):
+            raise _video_error("bad-range", f"at={t:.1f}s 超出视频区间 0–{total:.1f}s。")
+        key = hashlib.sha1(f"{info['id']}|detail|{t:.3f}|{width}".encode()).hexdigest()[:12]
+        out_dir = _inspect_cache_dir(cache_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        img = out_dir / f"{key}.jpg"
+        cached = img.exists()
+        if not cached:
+            _frame_at(path, t, img, max(640, int(width)))
+        result = {
+            "schema": 1, "video": info, "mode": "detail", "size": "detail",
+            "range": {"from": round(t, 2), "to": round(t, 2)},
+            "image": {"path": str(img), "t": round(t, 2)},
+            "frames": [{"t": round(t, 2)}], "sheet": None, "cached": cached,
+            "notes": ["detail 是单帧，区间参数已忽略"],
+        }
+        (out_dir / f"{key}.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        return result
+
+    notes: list[str] = []
+    if mode == "shots":
+        times, filled = shot_times(path, s0, e0, change=change,
+                                   limit=max(2, int(count or INSPECT_LIMIT_TILES)), probe=info)
+        if filled:
+            notes.append("画面变化少（口播/静态），已按等间隔补齐")
+    else:
+        n = int(count) if count else auto_sheet_count(max(0.2, e0 - s0))[0]
+        times = sheet_times(s0, e0, max(1, min(int(n), 96)))
+    if len(times) > INSPECT_LIMIT_TILES and not count:
+        times = times[:INSPECT_LIMIT_TILES]
+        notes.append(f"帧数封顶 {INSPECT_LIMIT_TILES}，用 from/to 缩小范围可看更细")
+
+    key = hashlib.sha1(f"{info['id']}|{mode}|{s0:.3f}|{e0:.3f}|{len(times)}|{width}|{cols}"
+                       f"|ch{change}|n{count or 0}".encode()).hexdigest()[:12]
+    out_dir = _inspect_cache_dir(cache_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sheet_path = out_dir / f"{key}.jpg"
+    cached = sheet_path.exists()
+    if cached:
+        meta = json.loads((out_dir / f"{key}.json").read_text(encoding="utf-8")) if (out_dir / f"{key}.json").exists() else None
+        if meta:
+            meta["cached"] = True
+            if notes:
+                meta["notes"] = list(dict.fromkeys((meta.get("notes") or []) + notes))
+            return meta
+    note = (f"{s0:.0f}–{e0:.0f}s / {total:.0f}s   ·   {len(times)} 帧 · {mode}")
+    drawn = _draw_sheet(path, times, sheet_path, width=width, cols=cols,
+                        title=path.stem, header_note=note)
+    frames = []
+    for i, t in enumerate(drawn["frames"]):
+        row, col = divmod(i, drawn["cols"])
+        frames.append({"t": round(t, 2), "row": row, "col": col})
+    result = {
+        "schema": 1, "video": info, "mode": mode, "size": "overview",
+        "range": {"from": round(s0, 2), "to": round(e0, 2)},
+        "sheet": {"path": drawn["path"], "cols": drawn["cols"], "rows": drawn["rows"],
+                  "cell": drawn["cell"], "header": drawn["header"], "width": width},
+        "frames": frames, "image": None, "cached": False, "notes": notes,
+    }
+    (out_dir / f"{key}.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    return result
+
+
+def _mmss(t: float) -> str:
+    t = max(0.0, float(t))
+    return f"{int(t // 60)}:{t % 60:04.1f}"
+
+
+def inspect_text(result: dict) -> str:
+    """紧凑文本（CLI 默认输出；工具面也只说这几行）。"""
+    v = result["video"]
+    lines = [f"视频：{v['path']} · {_mmss(v['duration'])} · {v['width']}×{v['height']}"
+             f" · {v['fps']:g}fps · {v['id']}"]
+    r = result["range"]
+    if result["mode"] == "detail":
+        lines.append(f"单帧：{_mmss(result['image']['t'])} · {result['image']['path']}")
+    else:
+        frames = result["frames"]
+        lines.append(f"区间：{_mmss(r['from'])}–{_mmss(r['to'])} · {result['mode']}"
+                     f" · {len(frames)} 帧 · {result['sheet']['cols']} 列")
+        lines.append("  ".join(f"#{i + 1} {f['t']:.1f}s" for i, f in enumerate(frames)))
+        lines.append(f"拼图：{result['sheet']['path']}")
+    for note in result.get("notes") or []:
+        lines.append(f"备注：{note}")
+    if result.get("cached"):
+        lines.append("（命中缓存）")
+    return "\n".join(lines)
 
 
 def _sheet_font(ImageFont, size: int):
@@ -2255,12 +2550,24 @@ def main() -> int:
     ap.add_argument("--realign", help="对已转写的目录补做句级对齐（不重新转写）")
     ap.add_argument("--export", help="从已转写目录（或 *.json）再导出发布稿，配合 --format")
     ap.add_argument("--sheet", metavar="OUT.jpg", help="导出「画面速览」：区间抽帧拼成一张 JPG")
+    ap.add_argument("--inspect", metavar="MEDIA", help="媒体理解（给 agent）：探测 + 抽帧拼图，传媒体文件路径")
+    ap.add_argument("--start", type=float, help="--inspect 起始秒（默认 0）")
+    ap.add_argument("--end", type=float, help="--inspect 结束秒（默认整条）")
+    ap.add_argument("--at", type=float, help="--inspect 只要这一秒的单帧（高清）")
+    ap.add_argument("--mode", choices=["shots", "uniform"], default="shots",
+                    help="--inspect 取帧策略：shots=画面变化点（默认），uniform=等间隔")
+    ap.add_argument("--size", choices=["overview", "detail"], default="overview",
+                    help="--inspect 输出：overview=拼图（默认），detail=单帧高清")
+    ap.add_argument("--change", type=int, default=INSPECT_CHANGE,
+                    help="--inspect shots 的画面变化阈值：dHash 汉明距离（默认 10，越小越敏感）")
+    ap.add_argument("--cache-dir", help="--inspect 缓存目录（默认 ~/.cache/video2text/inspect）")
     ap.add_argument("--sheet-start", type=float, default=0.0, help="速览起始秒（默认 0）")
     ap.add_argument("--sheet-end", type=float, help="速览结束秒（默认整条）")
     ap.add_argument("--sheet-count", type=int, default=None,
                     help="总帧数（默认按区间长度自动：约 48，0.5–30s 一帧）")
     ap.add_argument("--sheet-cols", type=int, default=8, help="每行帧数（默认 8）")
-    ap.add_argument("--sheet-width", type=int, default=320, help="每帧宽度像素（默认 320）")
+    ap.add_argument("--sheet-width", type=int, default=None,
+                    help="每帧宽度像素（--sheet 默认 320，--inspect 默认 480）")
     ap.add_argument("--sheet-title", help="速览页眉标题（默认用文件名）")
     ap.add_argument("--format", default="publish", choices=EXPORT_FORMATS,
                     help="导出格式：publish 发布稿 / script 纯口播 / chapters 章节 / srt 字幕 / bundle 打包")
@@ -2331,6 +2638,18 @@ def main() -> int:
             log(f"export error: {e}")
             return 2
 
+    if args.inspect:
+        try:
+            res = inspect_media(Path(args.inspect).expanduser(), start=args.start, end=args.end,
+                                mode=args.mode, size=args.size, at=args.at,
+                                count=args.sheet_count, width=args.sheet_width or 480,
+                                cols=args.sheet_cols, cache_dir=args.cache_dir, change=args.change)
+            print(json.dumps(res, ensure_ascii=False) if args.json else inspect_text(res))
+            return 0
+        except Exception as e:
+            log(f"inspect error: {e}")
+            return 2
+
     if args.sheet:
         media = Path(args.from_file or args.sheet_media or "").expanduser() if (args.from_file or getattr(args, "sheet_media", None)) else None
         if media is None:
@@ -2342,7 +2661,7 @@ def main() -> int:
         try:
             out = Path(args.sheet).expanduser()
             render_sheet(media, out, args.sheet_start, args.sheet_end,
-                         args.sheet_count, args.sheet_cols, args.sheet_width,
+                         args.sheet_count, args.sheet_cols, args.sheet_width or 320,
                          title=args.sheet_title or media.stem)
             print(out)
             return 0

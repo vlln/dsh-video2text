@@ -155,6 +155,33 @@ cp -R skills/video2text/scripts ~/.claude/skills/video2text/
 
 导入的任务是**只读收编**：删除只从列表移除、不删磁盘，媒体保留策略也不会碰它们。
 
+## 给 Agent 用（`video_text` / `video_frames`）
+
+这个包同时提供一个**独立于面板**的插件行 `dsh-video2text/inspect`，给 agent 两个工具：
+
+| 工具 | 输入 | 输出 |
+|---|---|---|
+| `video_text` | 媒体路径或 `vid_xxxxxxxx`、可选 `from`/`to` | 带时间码的逐句文字稿；没转写过就起后台任务 |
+| `video_frames` | 同上，另加 `mode`(shots/uniform)、`size`(overview/detail)、`at` | 一张拼图（含每格时间点）或某一秒的高清单帧 |
+
+要点：
+
+- **不需要 Job ID**：第一次传媒体文件路径，工具返回一个按文件指纹算的 `vid_<8位hex>`，之后传它即可（同一文件永远同一个 id）。
+- **25 秒软超时**：转写/长视频抽帧超过 25 秒就转成后台任务（`v2t-video-<id>`），完成时由 DSH 发会话内通知；工具调用本身立刻返回 `status: running`，再用同一个 vid 调一次就拿到结果。
+- **同素材只跑一次**：重复/并发请求复用同一个后台任务，不会重复转写。
+- **`mode: shots`** 只保留画面真的变了的帧（幻灯片、界面、字幕切换），用的是 dHash 感知哈希，不是 ffmpeg 的 `scene`（后者对幻灯片慢过渡几乎不敏感）。
+- 缓存：`$DSH_HOME/data/dsh-video-inspect/<vid>/`（媒体、转写、拼图、请求结果各一份），与面板的 `out/` 无关。
+- 关掉面板（`- id: dsh-video2text` + `disabled: true`）后，这两个工具照常工作。
+
+```yaml
+# cordis.patch.yml 里两行，可分别开关
+- insert:
+    - id: dsh-video2text          # 面板（人）
+    - id: dsh-video2text-inspect  # 工具（agent）
+```
+
+支持 mp4/mov/m4v/mkv/webm/avi/flv/ts/wmv；纯音频只出文字稿，抽帧会明确报 `[video:no-video-stream]`。
+
 ## 数据与权限
 
 | 内容 | 位置 |
