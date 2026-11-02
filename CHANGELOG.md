@@ -22,6 +22,7 @@
 
 - 任务菜单（三个点）新增「在文件夹中显示视频」与「打开任务目录」：走新路由 `/reveal`，按平台调用 `open -R` / `explorer /select,` / `xdg-open`，只接受已存在的任务 id。
 - 修了同一菜单里「复制链接」的 `copy is not defined`：它误用了 Viewer 作用域里的 copy，现在 Panel 有自己的 `copyText`。
+- 修任务菜单被列表容器裁剪：菜单原本是 `position: absolute`，而任务列表是 `overflow: auto`，结果只露出第一项、还撑出横向滚动条。改成按按钮坐标 `position: fixed` 渲染（上下空间不够会自动翻到上方），滚动/缩放时自动关闭。
 
 **设置**
 
