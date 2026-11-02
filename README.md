@@ -172,6 +172,7 @@ cp -R skills/video2text/scripts ~/.claude/skills/video2text/
 - **`mode: shots`** 只保留画面真的变了的帧（幻灯片、界面、字幕切换），用的是 dHash 感知哈希，不是 ffmpeg 的 `scene`（后者对幻灯片慢过渡几乎不敏感）。
 - 缓存：`$DSH_HOME/data/dsh-video-inspect/<vid>/`（媒体、转写、拼图、请求结果各一份），与面板的 `out/` 无关。
 - 关掉面板（`- id: dsh-video2text` + `disabled: true`）后，这两个工具照常工作。
+- 只想隐藏侧栏入口、不想动插件行：设置页关掉「在侧栏显示入口」（`show_panel`），刷新页面生效——agent 工具不受影响。
 
 ```yaml
 # cordis.patch.yml 里两行，可分别开关
