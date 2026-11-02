@@ -184,6 +184,8 @@ cp -R skills/video2text/scripts ~/.claude/skills/video2text/
 - 只想隐藏侧栏入口、不想动插件行：在 DSH 的 **Plugins** 页找到 `dsh-video2text`，把配置项 `showEntry` 关掉，刷新页面生效——agent 工具不受影响。
 - 登录态与各项设置统一在 **Settings → 视频转文案**；插件页只留 `showEntry` 一个开关。
 
+![插件页](docs/preview-plugins.png)
+
 ```yaml
 # cordis.patch.yml 里两行，可分别开关
 - insert:

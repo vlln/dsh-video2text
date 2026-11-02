@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Video to Text",
-    "description": "Turn a video link into publishing copy and a full transcript"
+    "description": "Sidebar workbench plus agent tools that read video (video_text / video_frames)"
   }
 }
