@@ -4,7 +4,7 @@ description: Use this skill when the user wants the 文案/口播稿/逐字稿/�
 license: MIT
 metadata:
   author: vlln
-  version: "0.2.1"
+  version: "0.2.2"
 ---
 
 # video2text
