@@ -88,7 +88,7 @@ Behaviour:
 - `mode: shots` keeps only frames whose picture actually changed (slides, screens, subtitle switches) using dHash, not ffmpeg's `scene` filter.
 - Cache lives in `$DSH_HOME/data/dsh-video-inspect/<vid>/`, separate from the panel's `out/`.
 - Disabling the panel row keeps both tools working.
-- To hide only the sidebar entry, turn off "Show the sidebar entry" in settings (`show_panel`) and reload; the agent tools are unaffected.
+- To hide only the sidebar entry, turn off the `showEntry` option of `dsh-video2text` on the DSH **Plugins** page and reload; the agent tools are unaffected.
 
 ## Where data lives
 
