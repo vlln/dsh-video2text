@@ -1,6 +1,6 @@
 <h1 align="center"><img src="icon.svg" alt="" width="32" align="absmiddle"> dsh-video2text</h1>
 
-<p align="center">Paste a video link, get the publishing copy and a full spoken transcript. The plugin ships its own skill; the UI is one sidebar workbench.</p>
+<p align="center">Paste a video link, get the publishing copy and a full spoken transcript — and hand agents two tools that read the transcript and watch the frames.</p>
 
 <p align="center">
   <a href="https://github.com/vlln/dsh-video2text/releases/latest"><img alt="version" src="https://img.shields.io/github/v/release/vlln/dsh-video2text?label=release"></a>
@@ -17,6 +17,8 @@ https://github.com/user-attachments/assets/b2129376-e838-494e-9b89-7041f4acf57c
 ![Panel](docs/preview.png)
 
 Chinese-first, works for Douyin, Xiaohongshu, WeChat Channels, Bilibili and YouTube. Transcription runs in the cloud by default (faster, better Chinese punctuation) and can be switched entirely to local. The media is written to disk before transcription finishes, so you can watch while it runs.
+
+The same video is also readable by agents: `video_text` returns a timestamped transcript window, `video_frames` returns one contact sheet with per-cell timestamps (or a single high-resolution frame). No panel needed, no internal concepts to learn.
 
 > 中文说明见 [README.md](README.md)。
 

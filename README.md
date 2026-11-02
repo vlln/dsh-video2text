@@ -1,6 +1,6 @@
 <h1 align="center"><img src="icon.svg" alt="" width="32" align="absmiddle"> dsh-video2text</h1>
 
-<p align="center">粘贴视频链接，得到「发布文案 + 口播逐字稿」。插件自带 skill，界面上是一个侧栏工作台。</p>
+<p align="center">粘贴视频链接，得到「发布文案 + 口播逐字稿」；同时给 agent 两个工具，让它能直接读文字稿、看画面。</p>
 
 <p align="center">
   <a href="https://github.com/vlln/dsh-video2text/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/vlln/dsh-video2text?label=release"></a>
@@ -18,6 +18,8 @@ https://github.com/user-attachments/assets/b2129376-e838-494e-9b89-7041f4acf57c
 
 以前取一条视频的文案要开网页、复制简介、手动听写、自己排版；批量十条就是十次重复。插件把解析、下载、转写、对齐、排版收进侧栏，产物落在一个目录里，可以直接打开、导出，或交给 agent 继续加工。
 
+同一条视频，agent 也能自己读：`video_text` 拿带时间码的文字稿窗口，`video_frames` 拿一张带每格时间点的画面拼图（或某一秒的高清单帧）。不需要打开面板，也不需要它理解任何内部概念。
+
 ![面板](docs/preview.png)
 
 ## 能做什么
@@ -32,6 +34,7 @@ https://github.com/user-attachments/assets/b2129376-e838-494e-9b89-7041f4acf57c
 | 账号 | 抖音、小红书扫码；视频号扫码 + 会话验证，缺登录时直接引导 |
 | 任务 | 搜索、按天分组、重试复用原卡、删除、从其它目录导入 |
 | 交给 agent | 「问 AI」新建会话、切到任务工作区、预填上下文 |
+| **读视频（agent）** | `video_text` / `video_frames` 两个工具：逐句文字稿窗口、带时间点的画面拼图、单帧高清；传媒体路径或 `vid_xxxxxxxx`，长任务自动转后台 |
 
 ## 安装
 
@@ -156,6 +159,12 @@ cp -R skills/video2text/scripts ~/.claude/skills/video2text/
 导入的任务是**只读收编**：删除只从列表移除、不删磁盘，媒体保留策略也不会碰它们。
 
 ## 给 Agent 用（`video_text` / `video_frames`）
+
+装上插件后，agent 直接就能用（不用打开面板）：
+
+> 「用 video_frames 看一下 `~/Movies/talk.mp4` 的 3:00–4:00，告诉我画面在讲什么」
+>
+> 「用 video_text 读 `~/Movies/talk.mp4` 第 8 分钟附近的文字稿，概括三点」
 
 这个包同时提供一个**独立于面板**的插件行 `dsh-video2text/inspect`，给 agent 两个工具：
 
